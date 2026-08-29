@@ -47,7 +47,8 @@ void StateManager::init()
  * Main update — called at 500 Hz from StateEstThread
  * ══════════════════════════════════════════════════════════════════════════ */
 
-void StateManager::update(float dt, const IMURaw imu[3], const CANIMURaw& can_imu, const MocapRaw& mocap)
+void StateManager::update(float dt, const IMURaw imu[3], const CANIMURaw& can_imu,
+                           const MocapRaw& mocap, const CanMotorState wheels[2])
 {
     if (!_initialized) return;
 
@@ -69,6 +70,24 @@ void StateManager::update(float dt, const IMURaw imu[3], const CANIMURaw& can_im
         Quat q_meas = { can_imu.q0, can_imu.q1, can_imu.q2, can_imu.q3 };
         for (int i = 0; i < NUM_LANES; ++i)
             _lanes[i].update_quaternion(q_meas, R_QUAT);
+    }
+
+    // ── 2.5. Wheel-encoder forward-velocity fusion (all lanes) ────────────
+    // Primary velocity source: wheel radius x angular rate, assuming the
+    // wheel is in contact with the ground (no slip detection/rejection --
+    // see STATEMGR_WHEEL_* and R_WHEEL_VEL comments). Between updates (and
+    // during any brief slip), EKF::predict()'s accel integration is what
+    // fills in / corrects the estimate.
+    if (wheels[0].valid || wheels[1].valid) {
+        float u_sum = 0.0f;
+        int   u_n   = 0;
+        if (wheels[0].valid) { u_sum += STATEMGR_WHEEL_L_SIGN * wheels[0].vel_rads * STATEMGR_WHEEL_RADIUS_M; u_n++; }
+        if (wheels[1].valid) { u_sum += STATEMGR_WHEEL_R_SIGN * wheels[1].vel_rads * STATEMGR_WHEEL_RADIUS_M; u_n++; }
+        const float u_wheel = u_sum / (float)u_n;
+        for (int i = 0; i < NUM_LANES; ++i) {
+            if (!_lanes[i].is_valid()) continue;
+            _lanes[i].update_wheel_velocity(u_wheel, R_WHEEL_VEL);
+        }
     }
 
     // ── 3. Select primary lane ────────────────────────────────────────────

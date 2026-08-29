@@ -8,8 +8,18 @@ Forked from BPRL_flight; drone-specific code removed and replaced with dual-bus 
 
 ## TODO
 
-- Implement balance controller (LQR / whole-body) in `BalanceController.cpp`.
-- Add EKF states for leg joint angles and rates.
+- Tune `PidBalanceController` and `HipLock` gains on the bench (currently
+  placeholder values; see those classes' headers).
+- Calibrate `ActuatorSafety`'s hip angle hard stops (`HIP_ANGLE_MIN/MAX_RAD`)
+  against the real linkage — currently a wide, uncalibrated ±90° placeholder.
+- Fill in `LqrBalanceController::K` with real gains from
+  `MatLab_controls/wheeled_biped.m` once `params()` reflects measured
+  hardware (currently all-zero stub).
+- Wire up the physical RC switches for `InputIdx::VEL_TGT` / `CTRL_SEL`
+  (placeholder SBUS channels 6/7 for now — see `Radio.cpp`).
+- Add leg joint angle / rate states to `StateIdx` + `FiveBarIK` module (see
+  `controls_plan.md`) — needed before the LQR controller can use real
+  theta/thetadot instead of its current 0 placeholder.
 - Register IMU and current sensor callbacks on FDCAN2 (CAN bus 2).
 - Implement SDC102 CAN protocol for Steadywin GIM6010-6 wheel motors.
 - Add firmware-side USB command handlers for `MOTOR,torque` and `MOTOR,velocity`.
@@ -58,9 +68,13 @@ BPRL_balance/
 │   │   └── ICM45686.hpp/.cpp TDK ICM-45686 6-DOF driver
 │   │
 │   ├── controllers/          Robot control algorithms
-│   │   ├── PID.hpp/.cpp                 Cascade PID with derivative filter + anti-windup
-│   │   ├── RobotStateMachine.hpp/.cpp   Mode dispatcher: IDLE / BALANCING / MANUAL (400 Hz)
-│   │   └── BalanceController.hpp/.cpp   Balance controller stub — TODO: implement LQR/WBC
+│   │   ├── PID.hpp/.cpp                        Cascade PID with derivative filter + anti-windup
+│   │   ├── RobotStateMachine.hpp/.cpp          Mode dispatcher: IDLE / BALANCING / MANUAL (400 Hz)
+│   │   ├── BalanceController.hpp/.cpp          Dispatches to Pid/LqrBalanceController via CTRL_SEL
+│   │   ├── PidBalanceController.hpp/.cpp       Stage 0: SLC PID cascade, hips locked
+│   │   ├── LqrBalanceController.hpp/.cpp       Stage 1: gain-scheduled LQR — stubbed (K = 0)
+│   │   ├── HipLock.hpp/.cpp                    Shared 4-motor hip position hold
+│   │   └── ActuatorSafety.hpp/.cpp             Final gate: angle/velocity/torque limits, always applied
 │   │
 │   ├── sensors/
 │   │   └── StrainRate.hpp/.cpp   4-channel strain rate sensor (CAN bus 1, ID 0x69)
@@ -129,7 +143,9 @@ StateManager selects the primary lane based on innovation residuals and blends w
 
 The 19 output states (`g_state[]`) add body-frame translational acceleration, angular velocity, and angular acceleration derived from the primary lane.
 
-Future: joint angles and joint rates will be appended beyond index 18 once leg kinematics are added.
+**Wheel-encoder velocity fusion:** body-frame forward velocity (`state[StateIdx::U]`) is primarily estimated from the two wheel motors' CAN encoder feedback (radius × angular rate, averaged, sign-corrected per `STATEMGR_WHEEL_*_SIGN` in `StateManager.hpp`) via a tight EKF measurement update, on the assumption the wheels stay in contact with the ground (no slip detection). Between updates — and during any brief slip — `EKF::predict()`'s accelerometer integration fills in / corrects the estimate.
+
+Future: joint angles and joint rates will be appended beyond index 18 once leg kinematics are added (see `controls_plan.md`).
 
 ---
 
@@ -145,12 +161,24 @@ Future: joint angles and joint rates will be appended beyond index 18 once leg k
 
 ### BalanceController
 
-Stub — outputs zero torque. Implement LQR or whole-body controller using:
-- `state[StateIdx::Q0..Q3]` — attitude quaternion
-- `state[StateIdx::P, Q, R]` — body angular rates
-- `input[InputIdx::ROLL_TGT]` — lean setpoint
-- `input[InputIdx::THRUST]` — forward speed demand
-- `input[InputIdx::YAW_RATE]` — yaw rate demand
+Dispatches between two balance controllers based on `input[InputIdx::CTRL_SEL]`, so both can be bench-tested without reflashing:
+
+| Controller | Selected when | Description |
+|---|---|---|
+| `PidBalanceController` | `CTRL_SEL < 0` | Stage 0: single-loop-cascade (SLC) PID — outer loop on forward velocity produces a pitch setpoint, inner loop on pitch produces wheel torque. Hips held at a fixed angle by `HipLock`. |
+| `LqrBalanceController` | `CTRL_SEL ≥ 0` | Stage 1: gain-scheduled LQR state feedback using gains from `wheeled_biped.m`. **Stubbed** — `K` is all-zero pending real gains once `params()` is measured. |
+
+Both read velocity target from `input[InputIdx::VEL_TGT]` and hold the hips via the shared `HipLock` helper (four independent per-motor position PIDs — see that class's header for why this doesn't need whole-body state to work correctly). Neither controller does steering/yaw mixing yet. `VEL_TGT`/`CTRL_SEL` read placeholder SBUS channels (6/7) until the physical RC switches are assigned — see `Radio.cpp`.
+
+### ActuatorSafety
+
+Final gate between whichever controller ran and the CAN commands actually sent — applied unconditionally in `ControlThread` right before the `can_motor_set_torque()` loop, so no mode or controller can bypass it. Per motor, using live CAN feedback:
+
+- **Hip motors only** — soft angle limits: torque driving a joint further toward its (placeholder, **must be calibrated against the real linkage**) hard stop is progressively reduced to zero over a margin before that stop; torque moving back toward center is never restricted.
+- **All six motors** — the same progressive-reduction shape applied to velocity, and an independent hard torque clamp at the actuator's rating.
+- **Fail-safe** — a motor with no valid CAN feedback yet is commanded zero torque.
+
+**A note on `PidBalanceController`'s signs:** its outer-loop sign looks backwards at first glance (this firmware's pitch convention is NED-native — positive = nose-up = body tilts *backward*, not the "lean forward to go forward" convention most balancing-robot writeups assume) and the plant is genuinely non-minimum-phase besides. Both loop signs were verified against `wheeled_biped.m`'s linearized and full nonlinear models before being written, not guessed — see the derivation comment at the top of `PidBalanceController.cpp` before changing either one.
 
 ---
 

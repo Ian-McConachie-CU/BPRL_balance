@@ -1,13 +1,20 @@
 #pragma once
 #include "EKF.hpp"
 #include "src/RobotState.hpp"
-#include "src/threads.hpp"   // IMURaw, CANIMURaw, MocapRaw
+#include "src/threads.hpp"        // IMURaw, CANIMURaw, MocapRaw
+#include "src/coms/CANMotor.hpp"  // CanMotorState (wheel-encoder velocity fusion)
 
 // Lowpass cutoff frequencies for derived derivative states (Hz)
 #define STATEMGR_LP_UVWDOT_HZ     50.0f   // cutoff for u_dot/v_dot/w_dot
 #define STATEMGR_LP_PQRDOT_HZ     50.0f   // cutoff for p_dot/q_dot/r_dot
 // IMX5 angular rate blend weight: 0=pure onboard gyros, 1=pure IMX5
 #define STATEMGR_IMX5_RATE_WEIGHT  0.3f
+
+// Wheel-encoder velocity fusion (see StateManager::update, step 2.5) --
+// tune these once real wheels/encoders are on the bench.
+#define STATEMGR_WHEEL_RADIUS_M   0.070f  // must match wheeled_biped.m's p.R
+#define STATEMGR_WHEEL_L_SIGN     (+1.0f) // flip to -1 if wheel L's encoder
+#define STATEMGR_WHEEL_R_SIGN     (+1.0f) // reads backwards vs. wheel R's
 
 /*
  * StateManager — multi-lane EKF orchestrator.
@@ -39,6 +46,13 @@ public:
     static constexpr float R_GRAVITY   = 0.5f;    // accel gravity-vector variance (m/s²)²
     static constexpr float R_MOCAP_POS = 1e-3f;   // mocap NED position variance (m²)
     static constexpr float R_MOCAP_VEL = 1e-2f;   // mocap NED velocity variance (m/s)²
+    // Wheel-encoder forward-velocity variance — deliberately tight relative
+    // to R_MOCAP_VEL/R_GRAVITY: wheel odometry is trusted as the PRIMARY
+    // velocity estimate (assumes the wheel is in contact with the ground,
+    // i.e. no slip detection), with IMU-only prediction (EKF::predict's
+    // accel integration) filling in between updates / correcting for any
+    // brief slip. See StateManager::update() step 2.5.
+    static constexpr float R_WHEEL_VEL = 2e-3f;
 
     StateManager();
 
@@ -49,7 +63,11 @@ public:
     // imu: snapshot of g_imu[3] (taken under imu_mtx before this call).
     // can_imu: snapshot of g_can_imu (taken under can_imu_mtx before this call).
     // mocap: snapshot of g_mocap (taken under mocap_mtx before this call).
-    void update(float dt, const IMURaw imu[3], const CANIMURaw& can_imu, const MocapRaw& mocap);
+    // wheels: snapshot of the two wheel motors' CAN state (ids 5, 6 — Wheel
+    //         L, Wheel R — via can_motor_get_state(), which is internally
+    //         mutex-protected, no separate lock needed by the caller).
+    void update(float dt, const IMURaw imu[3], const CANIMURaw& can_imu,
+                const MocapRaw& mocap, const CanMotorState wheels[2]);
 
     // Full 19-element state output — maps 13-state EKF lanes onto StateIdx ordering
     // and fills in the 6 derived quantities (uvw_dot, pqr_dot).

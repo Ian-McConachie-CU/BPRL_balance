@@ -53,10 +53,17 @@ namespace StateIdx {
 }
 
 namespace InputIdx {
-    constexpr int THRUST      = 0; // forward/speed demand [0, 1]
+    constexpr int THRUST      = 0; // forward/speed demand [0, 1] -- legacy drone-style
+                                    // throttle input, unused by the balance controllers
     constexpr int ROLL_TGT    = 1; // lean / balance setpoint [-1, 1]
     constexpr int PITCH_TGT   = 2; // pitch setpoint [-1, 1]
     constexpr int YAW_RATE    = 3; // yaw rate demand [-1, 1]
     constexpr int MODE_SW     = 4; // mode switch [-1,1]; <0=IDLE, >=0=BALANCE
-    constexpr int N_INPUTS    = 5;
+    constexpr int VEL_TGT     = 5; // forward velocity demand [-1, 1], scaled to m/s by
+                                    // the balance controller's own tunable max-velocity
+                                    // constant. RC channel/switch assignment not yet
+                                    // finalized on the transmitter -- see Radio.cpp.
+    constexpr int CTRL_SEL    = 6; // balance controller select: <0 = PID cascade,
+                                    // >=0 = LQR. RC channel TBD, see Radio.cpp.
+    constexpr int N_INPUTS    = 7;
 }

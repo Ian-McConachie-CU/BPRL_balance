@@ -21,6 +21,7 @@
 #include "src/coms/CANPower.hpp"
 #include "src/coms/Radio.hpp"
 #include "src/controllers/RobotStateMachine.hpp"
+#include "src/controllers/ActuatorSafety.hpp"
 #include "src/state_estimator/StateManager.hpp"
 #include "src/logging/Logger.hpp"
 #include "src/logging/LogMessages.hpp"
@@ -61,6 +62,7 @@ static MUTEX_DECL(s_usb_write_mtx);
 /* ── Controller + estimator instances ───────────────────────────────────── */
 static RobotStateMachine robot_sm;
 static StateManager      state_mgr;
+static ActuatorSafety    actuator_safety;
 
 /* ── Thread working areas ────────────────────────────────────────────────── */
 static THD_WORKING_AREA(waSPI,       2048);
@@ -209,7 +211,13 @@ static THD_FUNCTION(StateEstThread, arg)
         g_mocap.has_new = false;
         chMtxUnlock(&mocap_mtx);
 
-        state_mgr.update(dt, imu_snap, can_snap, mocap_snap);
+        // Wheel motors (CAN ids 5, 6 — Wheel L, Wheel R). can_motor_get_state()
+        // is internally mutex-protected (motor_state_mtx), safe to call here.
+        CanMotorState wheel_snap[2] = {};
+        can_motor_get_state(5, &wheel_snap[0]);
+        can_motor_get_state(6, &wheel_snap[1]);
+
+        state_mgr.update(dt, imu_snap, can_snap, mocap_snap, wheel_snap);
 #ifdef BPRL_DEBUG
         if (can_snap.has_new_quat)  s_can_quat_cnt++;
         if (can_snap.has_new_rates) s_can_rate_cnt++;
@@ -256,6 +264,11 @@ static THD_FUNCTION(ControlThread, arg)
         float torques[6] = {};
         robot_sm.update(state_snap, input_snap, armed_snap, torques);
 
+        // Final safety gate — always applied, regardless of mode/controller
+        // (see ActuatorSafety.hpp): hip soft angle limits, velocity soft
+        // limits, hard torque clamps, fail-safe zero on missing feedback.
+        actuator_safety.apply(torques);
+
         // Send torque commands to all 6 motors
         for (int i = 0; i < 6; i++)
             can_motor_set_torque((uint8_t)(i + 1), torques[i]);
@@ -285,7 +298,9 @@ static THD_FUNCTION(RadioThread, arg)
         g_input[InputIdx::ROLL_TGT]    = radio_roll();
         g_input[InputIdx::PITCH_TGT]   = radio_pitch();
         g_input[InputIdx::YAW_RATE]    = radio_yaw();
-        g_input[InputIdx::MODE_SW] = radio_mode_sw();
+        g_input[InputIdx::MODE_SW]     = radio_mode_sw();
+        g_input[InputIdx::VEL_TGT]     = radio_vel_tgt();
+        g_input[InputIdx::CTRL_SEL]    = radio_ctrl_sel();
         g_armed = radio_armed();
         chMtxUnlock(&state_mtx);
 

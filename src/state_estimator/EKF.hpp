@@ -52,6 +52,12 @@ public:
     void update_position(const float xyz[3], float R_var);
     void update_ned_vel (const float vel[3], float R_var);
 
+    // Wheel-encoder body-frame forward velocity (u only — wheels give no
+    // direct v/w information). u_meas: wheel radius x average angular rate,
+    // sign-corrected for mounting (see StateManager). R_var: measurement
+    // noise variance.
+    void update_wheel_velocity(float u_meas, float R_var);
+
     // Accessors
     const float* state()          const { return _x; }
     float        innovation_norm() const { return _innov_norm; }

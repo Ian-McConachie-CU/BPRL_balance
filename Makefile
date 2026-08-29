@@ -128,6 +128,10 @@ CPPSRC = $(ALLCPPSRC) \
          src/controllers/PID.cpp \
          src/controllers/RobotStateMachine.cpp \
          src/controllers/BalanceController.cpp \
+         src/controllers/PidBalanceController.cpp \
+         src/controllers/LqrBalanceController.cpp \
+         src/controllers/HipLock.cpp \
+         src/controllers/ActuatorSafety.cpp \
          src/coms/IMUs/ICM42688.cpp \
          src/coms/IMUs/ICM45686.cpp \
          src/coms/SPI.cpp \

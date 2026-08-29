@@ -344,6 +344,18 @@ void EKF::update_ned_vel(const float vel_ned[3], float R_var)
     _update(3, H, R_diag, innov);
 }
 
+void EKF::update_wheel_velocity(float u_meas, float R_var)
+{
+    if (!_initialized) return;
+
+    float H[1][N] = {};
+    H[0][iU] = 1.0f;
+
+    const float R_diag[1] = { R_var };
+    const float innov[1]  = { u_meas - _x[iU] };
+    _update(1, H, R_diag, innov);
+}
+
 /* ══════════════════════════════════════════════════════════════════════════
  * Generic measurement update: m ≤ 6 measurements.
  *
