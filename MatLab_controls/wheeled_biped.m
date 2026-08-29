@@ -102,6 +102,8 @@ wb.schedule      = @scheduleGains;
 wb.evalGains     = @evalGains;
 wb.workspace     = @workspaceReport;
 wb.simulate      = @simulate;
+wb.simulatePid   = @simulatePid;
+wb.defaultPidGains = @defaultPidGains;
 wb.robotFrame    = @robotFrame;
 wb.selfcheck     = @selfcheck;
 end
@@ -744,7 +746,7 @@ if ~isfield(opts, 'noiseStd')
     % Rough IMU/encoder-class placeholders, NOT measured on real hardware --
     % replace once real sensor noise is characterized. Order matches s0:
     %   x [m], theta [rad], phi [rad], xdot [m/s], thetadot [rad/s], phidot [rad/s]
-    opts.noiseStd = [0.005, 0.003, 0.003, 0.02, 0.01, 0.01];
+    opts.noiseStd = [0.01, 0.005, 0.005, 0.08, 0.05, 0.05];
 end
 if ~isfield(opts, 'delay'),        opts.delay = 0;         end
 if ~isfield(opts, 'vRef'),         opts.vRef  = @(t) 0;    end
@@ -797,6 +799,194 @@ end
 function u = satur(u, lim)
 u(1) = max(min(u(1),  lim(1)), -lim(1));
 u(2) = max(min(u(2),  lim(2)), -lim(2));
+end
+
+% =========================================================================
+% SLC PID cascade simulation -- mirrors src/controllers/PidBalanceController
+% .cpp and HipLock.cpp EXACTLY (same control-law structure, same discrete
+% PID formula including anti-windup and the low-pass-filtered derivative
+% from src/controllers/PID.cpp), so gains tuned here transfer directly to
+% those C++ constexpr values. Uses the SAME sensor-noise/delay/velocity-
+% tracking harness as simulate() -- see that function's help for opts.
+% =========================================================================
+function gains = defaultPidGains()
+%DEFAULTPIDGAINS  Current src/controllers/PidBalanceController.hpp and
+%                 HipLock.hpp constexpr values, mirrored here as the
+%                 starting point for tuning. KEEP THESE TWO FILES IN SYNC
+%                 BY HAND -- there is no automatic link between MATLAB and
+%                 the C++ constexpr values; when you land on gains you
+%                 like here, copy the numbers back into those two headers.
+%
+%   PidBalanceController.hpp:
+gains.vel_kp   = 0.15;   % VEL_KP
+gains.vel_ki   = 0.0;    % VEL_KI
+gains.vel_kd   = 0.0;    % VEL_KD
+gains.vel_imax = 0.35;   % VEL_IMAX (== MAX_LEAN_RAD there)
+gains.max_lean          = 0.35;  % MAX_LEAN_RAD           [rad]
+gains.max_vel_mps       = 1.0;   % MAX_VELOCITY_MPS        [m/s]
+gains.pitch_kp          = 15.0;  % PITCH_KP
+gains.pitch_ki          = 0.0;   % PITCH_KI
+gains.pitch_kd          = 0.5;   % PITCH_KD
+gains.pitch_imax        = 4.0;   % PITCH_IMAX (== WHEEL_TORQUE_LIMIT_NM there)
+gains.wheel_torque_limit = 4.0;  % WHEEL_TORQUE_LIMIT_NM   [N.m]
+%   HipLock.hpp (lumped equivalent -- see simulatePid's help for why a
+%   single PID on thL=phi-theta is the right lumped stand-in for four
+%   independent per-motor position PIDs):
+gains.hip_kp            = 8.0;   % KP                      [N.m/rad]
+gains.hip_ki            = 0.0;   % KI
+gains.hip_kd            = 0.3;   % KD                      [N.m/(rad/s)]
+gains.hip_imax          = 2.0;   % IMAX                    [N.m]
+gains.hip_torque_limit  = 8.0;   % TORQUE_LIMIT_NM         [N.m]
+gains.hip_target_thL    = 0.0;   % TARGET_*_RAD (all 0 there)  [rad]
+end
+
+function pidstate = pidInit()
+%PIDINIT  Fresh state for pidStep -- mirrors PID.cpp's constructor state.
+pidstate = struct('integrator', 0.0, 'last_error', 0.0, 'last_deriv', 0.0, 'valid', false);
+end
+
+function [out, pidstate] = pidStep(pidstate, error, dt, kp, ki, kd, imax, fcut_hz)
+%PIDSTEP  One discrete PID update -- exact port of PID::update() in
+%         src/controllers/PID.cpp: P + anti-windup-clamped I + low-pass-
+%         filtered D. dt is passed in directly (fixed-step sim) rather than
+%         measured from a clock, so the stale-input-reset branch in the
+%         real PID class has no equivalent here -- always assume dt is
+%         valid.
+if nargin < 8 || isempty(fcut_hz), fcut_hz = 30.0; end
+
+if ~pidstate.valid
+    pidstate.last_error = error;
+    pidstate.valid      = true;
+    out = kp * error;
+    return
+end
+
+pidstate.integrator = pidstate.integrator + ki * error * dt;
+pidstate.integrator = max(min(pidstate.integrator, imax), -imax);
+out = kp * error + pidstate.integrator;
+
+if dt > 0.0
+    raw_d = (error - pidstate.last_error) / dt;
+    tau   = 1.0 / (2*pi*fcut_hz);
+    alpha = dt / (dt + tau);
+    pidstate.last_deriv = alpha*raw_d + (1.0-alpha)*pidstate.last_deriv;
+    out = out + kd * pidstate.last_deriv;
+end
+
+pidstate.last_error = error;
+end
+
+function [t, S, U, Sy] = simulatePid(p, L, gains, s0, tf, uLim, opts)
+%SIMULATEPID  Run the SLC PID cascade (+ hip lock) on the FULL nonlinear
+%             plant, at a fixed control rate, with the same sensor-noise/
+%             delay/velocity-tracking harness as simulate() (see its help
+%             for opts.dt/noiseStd/delay/vRef/stepCallback).
+%
+%   gains: see defaultPidGains() for the fields and their C++ counterparts.
+%
+%   Control law -- outer/inner loop match PidBalanceController.cpp exactly
+%   (see that file's derivation comment for why the outer loop's sign is
+%   NOT the naive "lean forward to go forward" story: this codebase's pitch
+%   is NED-native, positive = nose-up = body tilts BACKWARD):
+%     thL       = phi - theta
+%     Tp        = hipPID( thL - gains.hip_target_thL )   <- NOTE THE SIGN
+%     pitch_sp  = clamp( -velPID(vRef(t) - xdot), +-gains.max_lean )
+%     T         = clamp( pitchPID(pitch_sp - phi), +-gains.wheel_torque_limit )
+%
+%   The hip-lock error is (thL - target), the OPPOSITE of the usual
+%   "target - measurement" convention pitch/velocity use above -- this is
+%   not a typo. Tp is a virtual/lumped quantity in THIS file's reduced
+%   3-DOF (x,theta,phi) dynamics, not a real motor's own torque, and how it
+%   enters those coupled equations of motion (via the mass matrix) turns
+%   out to need the flipped sign -- found the hard way, by grid-searching
+%   sign combinations against this file's linearized model and confirming
+%   against the full nonlinear sim (see git history / session notes for
+%   PidBalanceController.cpp's derivation comment, which documents the same
+%   search for the outer/inner loop signs).
+%
+%   IMPORTANT CAVEAT this hip-lock law does NOT resolve: it does NOT
+%   directly verify HipLock.cpp's sign. HipLock.cpp runs four independent,
+%   ordinary "target - measurement" position PIDs on the REAL per-motor
+%   joint angles (phi1, phi4), which are directly, individually actuated --
+%   a different mathematical object from this file's single lumped Tp, and
+%   the standard sign is very likely correct there for the ordinary reason
+%   any directly-actuated single joint is stabilized by plain PD position
+%   feedback. But that argument is physical reasoning, not a numerical
+%   verification of the kind everything else in this file gets -- this
+%   file has no individual-link 5-bar dynamics to check it against. Treat
+%   HipLock's sign as reasoned-but-NOT-verified until someone builds that
+%   model (or verifies it very carefully on a restrained bench robot).
+if nargin < 5 || isempty(tf),   tf   = 6;                        end
+if nargin < 6 || isempty(uLim), uLim = [2*p.tau_wheel_peak, 40]; end
+if nargin < 7, opts = struct(); end
+if ~isfield(opts, 'dt'),       opts.dt = 1/400;              end
+if ~isfield(opts, 'noiseStd')
+    opts.noiseStd = [0.005, 0.003, 0.003, 0.02, 0.01, 0.01];
+end
+if ~isfield(opts, 'delay'),        opts.delay = 0;         end
+if ~isfield(opts, 'vRef'),         opts.vRef  = @(t) 0;    end
+if ~isfield(opts, 'stepCallback'), opts.stepCallback = []; end
+
+dt      = opts.dt;
+nDelay  = max(0, round(opts.delay/dt));
+nSteps  = max(1, round(tf/dt));
+odeOpts = odeset('RelTol', 1e-8, 'AbsTol', 1e-10);
+
+s  = s0(:);
+t  = zeros(nSteps+1, 1);
+S  = zeros(nSteps+1, 6); S(1,:)  = s.';
+Sy = zeros(nSteps+1, 6); Sy(1,:) = s.';
+U  = zeros(nSteps+1, 2);
+
+delayBuf = repmat(s.', nDelay+1, 1);
+
+velPid = pidInit(); pitchPid = pidInit(); hipPid = pidInit();
+
+for k = 1:nSteps
+    tk = (k-1)*dt;
+
+    % ---- sensor model: additive noise on the TRUE state, then delay ----
+    s_meas   = s + opts.noiseStd(:).*randn(6,1);
+    delayBuf = [delayBuf(2:end, :); s_meas.'];
+    s_ctrl   = delayBuf(1, :).';
+    theta = s_ctrl(2); phi = s_ctrl(3); xdot = s_ctrl(4);
+
+    % ---- hip lock: hold thL = phi - theta at gains.hip_target_thL ----
+    % Error is (thL - target), NOT (target - thL) -- see this function's
+    % help before "fixing" this sign back to the usual convention.
+    thL = phi - theta;
+    [Tp, hipPid] = pidStep(hipPid, thL - gains.hip_target_thL, dt, ...
+                            gains.hip_kp, gains.hip_ki, gains.hip_kd, gains.hip_imax);
+    Tp = max(min(Tp, gains.hip_torque_limit), -gains.hip_torque_limit);
+
+    % ---- outer loop: velocity error -> pitch setpoint (note the sign --
+    %      realized here via NEGATIVE gains into pidStep, exactly like
+    %      PidBalanceController's constructor passes -VEL_KP etc.) ----
+    vel_err = opts.vRef(tk) - xdot;
+    [pitch_sp, velPid] = pidStep(velPid, vel_err, dt, ...
+                                  -gains.vel_kp, -gains.vel_ki, -gains.vel_kd, gains.vel_imax);
+    pitch_sp = max(min(pitch_sp, gains.max_lean), -gains.max_lean);
+
+    % ---- inner loop: pitch error -> wheel torque ----
+    [T, pitchPid] = pidStep(pitchPid, pitch_sp - phi, dt, ...
+                             gains.pitch_kp, gains.pitch_ki, gains.pitch_kd, gains.pitch_imax);
+    T = max(min(T, gains.wheel_torque_limit), -gains.wheel_torque_limit);
+
+    u = satur([T; Tp], uLim);
+
+    [~, ss] = ode45(@(~, y) nlDynamics(p, y, u, L), [tk, tk + dt], s, odeOpts);
+    s = ss(end, :).';
+
+    t(k+1)    = tk + dt;
+    S(k+1, :) = s.';
+    Sy(k+1,:) = s_ctrl.';
+    U(k, :)   = u.';
+
+    if ~isempty(opts.stepCallback)
+        opts.stepCallback(t(k+1), s, u);
+    end
+end
+U(end, :) = U(end-1, :);
 end
 
 % =========================================================================
@@ -1124,6 +1314,33 @@ leansBackward = (pts.bodyTip(1) - Omid(1)) < 0;
 fprintf('   phi = +15 deg (this file''s own NED-native state)\n');
 fprintf('   positive pitch leans body top backward (-x), matching firmware convention: %s\n', pf(leansBackward));
 ok = ok && leansBackward;
+
+hdr('13. PID cascade (simulatePid): first-tick sign sanity');
+% NOT a tuning/settling check -- whether the default gains actually settle
+% depends on gains AND params() being matched to each other (that's the
+% whole point of simulatePid: tune them together). This only checks that
+% each loop's SIGN is right, using the fact that pidStep's very first call
+% is deterministic (out = kp*error, no I/D yet) -- gain-magnitude-
+% independent as long as gains are positive, so it stays meaningful however
+% params()/gains get tuned.
+gains = defaultPidGains();
+bigLim = [1e6, 1e6];  % effectively unlimited -- isolate the sign, not saturation
+
+% Hip lock: thL = phi-theta = 4 deg > target(0) should give Tp > 0 --
+% see simulatePid's help for why this is (thL-target), not (target-thL).
+s0 = [0; deg2rad(-2); deg2rad(2); 0; 0; 0];
+[~, ~, U1] = simulatePid(p, 0.25, gains, s0, 1/400, bigLim, struct('noiseStd', zeros(1,6)));
+hipSignOk = U1(1,2) > 0;
+fprintf('   hip-lock Tp sign for thL=phi-theta > target : %s\n', pf(hipSignOk));
+
+% Outer+inner: stepping vRef to +1 m/s from rest should give T < 0 on the
+% very first tick (pitch_sp goes negative, phi is still 0) -- see
+% PidBalanceController.cpp's derivation comment for why.
+[~, ~, U2] = simulatePid(p, 0.25, gains, zeros(6,1), 1/400, bigLim, ...
+                          struct('noiseStd', zeros(1,6), 'vRef', @(t) 1.0));
+velSignOk = U2(1,1) < 0;
+fprintf('   wheel torque sign on a forward-velocity step from rest      : %s\n', pf(velSignOk));
+ok = ok && hipSignOk && velSignOk;
 
 fprintf('\n%s\n', repmat('=', 1, 72));
 if ok, fprintf('ALL CHECKS PASS\n'); else, fprintf('SOME CHECKS FAILED\n'); end

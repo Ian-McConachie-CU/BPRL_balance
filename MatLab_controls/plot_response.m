@@ -1,10 +1,18 @@
-function plot_response()
+function plot_response(controller)
 %PLOT_RESPONSE  Live, looping closed-loop simulation.
 %
-%  The scheduled LQR balances the full nonlinear plant while tracking a
-%  1 Hz sinusoidal forward-velocity target, with realistic sensor noise
-%  (and a small sensor/CAN/compute delay) injected between the TRUE plant
-%  state and what the controller actually acts on -- see wb.simulate's
+%  plot_response()        -- runs the LQR (default)
+%  plot_response('lqr')   -- gain-scheduled LQR (wb.simulate)
+%  plot_response('pid')   -- SLC PID cascade + hip lock (wb.simulatePid) --
+%                             edit the `gains` struct in section 1 below to
+%                             tune it; each field maps 1:1 to a constexpr in
+%                             src/controllers/PidBalanceController.hpp /
+%                             HipLock.hpp -- see wb.defaultPidGains's help.
+%
+%  Either controller balances the full nonlinear plant while tracking a
+%  sinusoidal forward-velocity target, with realistic sensor noise (and a
+%  small sensor/CAN/compute delay) injected between the TRUE plant state
+%  and what the controller actually acts on -- see wb.simulate's
 %  opts.noiseStd / opts.delay. Runs indefinitely, advancing in short
 %  chunks and redrawing live, until you close either figure window (or
 %  Ctrl+C).
@@ -31,20 +39,64 @@ function plot_response()
 %  Uses only base MATLAB graphics (patch, line, rectangle, drawnow) -- no
 %  toolbox required for the plotting/animation itself.
 
+if nargin < 1 || isempty(controller), controller = 'lqr'; end
+controller = lower(controller);
+
 clc; close all;
 
 wb = wheeled_biped();
 p  = wb.params();
 
-%% ---- 1. controller: same defaults as wheeled_biped's selfcheck ----------
-%        edit these to match whatever you're tuning
-Q     = diag([80 8 40 2 800 8]);   % [x, xdot, theta, thetadot, phi, phidot]
-R     = diag([12 1]);              % [wheel torque, hip torque]
-Lgrid = linspace(0.16, 0.34, 25);
-sched = wb.schedule(p, Q, R, Lgrid, 3);
+%% ---- 1. controller ----------------------------------------------------
+switch controller
+case 'lqr'
+    % same defaults as wheeled_biped's selfcheck -- edit to match whatever
+    % you're tuning
+    Q     = diag([80 8 40 2 800 8]);   % [x, xdot, theta, thetadot, phi, phidot]
+    R     = diag([12 1]);              % [wheel torque, hip torque]
+    Lgrid = linspace(0.16, 0.34, 25);
+    sched = wb.schedule(p, Q, R, Lgrid, 3);
+case 'pid'
+    % Mirrors src/controllers/PidBalanceController.hpp / HipLock.hpp --
+    % edit these to tune, then copy the numbers you like back into those
+    % two files. See wb.defaultPidGains's help for what each field is and
+    % simulatePid's help for the (verified, non-obvious) sign convention
+    % on gains.hip_kp/hip_kd -- don't "fix" that sign without re-reading it.
+    %
+    % wb.defaultPidGains()'s numbers are tuned for an OLDER, lighter
+    % params() (m_b=6, R=0.07). With the current, heavier params() (m_b=15,
+    % R=0.09) the open-loop instability is faster (~19 rad/s vs ~12.7
+    % rad/s), and those defaults diverge almost immediately. The overrides
+    % below settle cleanly from 3/10/20 deg disturbances and track a
+    % velocity command correctly, verified with simOpts.delay = 0 --
+    % see the IMPORTANT note below before trusting it beyond that.
+    gains = wb.defaultPidGains();
+    gains.pitch_kp = 15;  gains.pitch_kd = 1;   gains.vel_kp = 0.1;
+    gains.hip_kp   = 60;  gains.hip_kd   = 10;
+    gains.wheel_torque_limit = 15; gains.pitch_imax = 15;
+    gains.hip_torque_limit  = 11;
+    %
+    % IMPORTANT: with simOpts.delay left at its default 10 ms (below), this
+    % still diverges -- and not from a bad gain choice. I checked both much
+    % more aggressive and much more conservative gains than these; NONE
+    % handle 10 ms of delay at this mass. The full LQR handles the exact
+    % same delay and params trivially (settles from the same disturbances
+    % using only 1-5 Nm). That's because the LQR's T depends on theta too,
+    % and its Tp depends on phi too -- this simple cascade's T only sees
+    % (phi,phidot,xdot) and its Tp only sees thL -- so it has fundamentally
+    % less phase margin for the SAME disturbance rejection speed. This is a
+    % real structural limit of the decoupled cascade at this operating
+    % point, not a tuning mistake -- it's exactly the gap Stage 1 (the LQR)
+    % exists to close. Set simOpts.delay = 0 below to tune/observe the
+    % cascade's own behavior in isolation from that limit, or revisit
+    % params() (m_b tripled without I_b changing -- see chat history) if a
+    % lighter/more realistic body brings the open-loop pole back down.
+otherwise
+    error('plot_response:controller', 'controller must be ''lqr'' or ''pid''');
+end
 
 %% ---- 2. velocity target + sensor model -----------------------------------
-L    = 0.25;                             % leg length held constant this run
+L    = 0.12;                             % leg length held constant this run
 fHz  = 0.1;                              % velocity-target frequency
 vAmp = 1.00;                             % velocity-target amplitude [m/s]
 vRef = @(tAbs) vAmp * sin(2*pi*fHz*tAbs);
@@ -55,19 +107,20 @@ simOpts = struct();
 simOpts.dt       = 1/400;
 % Rough IMU/encoder-class noise placeholders (see wb.simulate help) -- NOT
 % measured on real hardware, replace once it is:
-simOpts.noiseStd = [0.005, 0.003, 0.003, 0.02, 0.01, 0.01];
-simOpts.delay    = 0.010;                % 10 ms sensor/CAN/compute latency
+simOpts.noiseStd = [0.01, 0.005, 0.005, 0.08, 0.05, 0.05];
+simOpts.delay    = 0.00;                % 10 ms sensor/CAN/compute latency
 
 %% ---- 3. figures: rolling time-series + live 2D animation -----------------
 histSec = 8;                             % rolling window shown in the time-series plot
 nHist   = round(histSec / simOpts.dt);
 
-figTS = figure('Name', 'Response (live)', 'Position', [50 50 900 700]);
+figTS = figure('Name', sprintf('Response (live) -- %s', upper(controller)), 'Position', [50 50 900 700]);
 axV = subplot(3,1,1); hold(axV, 'on'); grid(axV, 'on');
 hVref = plot(axV, nan, nan, 'Color', [0.6 0.6 0.6], 'LineWidth', 1.5, 'DisplayName', 'v_{ref}');
 hVact = plot(axV, nan, nan, 'Color', [0.1 0.4 0.8], 'LineWidth', 1.5, 'DisplayName', 'v_{actual}');
 ylabel(axV, 'xdot [m/s]'); legend(axV, 'Location', 'best');
-title(axV, sprintf('Tracking a %.1f Hz, %.2f m/s sinusoidal velocity target (note the phase lag -- see help)', fHz, vAmp));
+title(axV, sprintf('[%s] Tracking a %.1f Hz, %.2f m/s sinusoidal velocity target (note the phase lag -- see help)', ...
+    upper(controller), fHz, vAmp));
 
 axAng = subplot(3,1,2); hold(axAng, 'on'); grid(axAng, 'on');
 hTh = plot(axAng, nan, nan, 'LineWidth', 1.5, 'DisplayName', '\theta (leg)');
@@ -204,13 +257,18 @@ s0        = [0; 0; 0; 0; 0; 0];
 tElapsed  = 0;
 chunkSec  = 1;
 
-fprintf('Running -- close either figure window to stop.\n');
+fprintf('Running [%s] -- close either figure window to stop.\n', upper(controller));
 while ishandle(figTS) && ishandle(figAnim)
     t0 = tElapsed;
     simOpts.vRef         = @(tRel) vRef(t0 + tRel);
     simOpts.stepCallback = @(tRel, s, u) drawFrame(t0 + tRel, s, u);
 
-    [~, S] = wb.simulate(p, sched, L, s0, chunkSec, uLim, simOpts);
+    switch controller
+    case 'lqr'
+        [~, S] = wb.simulate(p, sched, L, s0, chunkSec, uLim, simOpts);
+    case 'pid'
+        [~, S] = wb.simulatePid(p, L, gains, s0, chunkSec, uLim, simOpts);
+    end
 
     s0       = S(end,:).';
     tElapsed = tElapsed + chunkSec;

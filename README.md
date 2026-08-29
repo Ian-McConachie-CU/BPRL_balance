@@ -222,6 +222,7 @@ Log files are ArduPilot DataFlash binary format — open with [UAV Log Viewer](h
 
 - ARM GCC cross-compiler (`arm-none-eabi-gcc`)
 - `make`
+- `python3` for the flash upload script
 
 ### Build
 
@@ -234,22 +235,32 @@ make
 Debug build (enables `$TEL` / `$EKFL` / `$IMU` USB telemetry streams):
 
 ```bash
-make EXTRA_CFLAGS=-DBPRL_DEBUG
+make UDEFS_EXTRA=-DBPRL_DEBUG
 ```
 
-### Flash
-
-Via USB bootloader (requires ArduPilot bootloader at 0x08000000):
+Clean build directory:
 
 ```bash
-python3 tools/flash_upload.py build/BPRL_BALANCE.bin
+make clean
 ```
 
-Or with `dfu-util`:
+### Upload
+
+**Via Cube USB bootloader** (builds first, then flashes):
 
 ```bash
-dfu-util -a 0 -s 0x08020000:leave -D build/BPRL_BALANCE.bin
+make flash PORT=/dev/ttyACM0
 ```
+
+`tools/flash_upload.py` handles the protocol; `PORT` defaults to `/dev/ttyACM0` if omitted.
+
+**Via ST-Link / OpenOCD:**
+
+```bash
+make flash-stlink
+```
+
+Requires OpenOCD with `interface/stlink.cfg` and `target/stm32h7x.cfg`.
 
 ---
 
