@@ -54,40 +54,69 @@
 /* Trigger Memory Size in bytes.*/
 #define SRAMCAN_TM_SIZE                 (2U * 4U)
 
+/* ── BPRL message-RAM layout override ───────────────────────────────────────
+ * Upstream derives every one of these start addresses from stm32_registry.h's
+ * absolute-maximum element counts (128 standard filters, 128 extended
+ * filters, 64 RxFIFO0/1 elements, 64 Rx buffers, 32 Tx event FIFO, 32 Tx
+ * buffers, 64 trigger-memory slots). Summed at 18-word (72-byte, max
+ * CAN-FD-size) elements each, that comes to ~18 KB PER FDCAN INSTANCE —
+ * SRAMCAN_TBSA alone lands at byte 15616, already past the STM32H7's entire
+ * ~10 KB (2560-word) physical message RAM for ONE instance, let alone the
+ * two (CAND1+CAND2) this project uses. On top of that, nothing in this file
+ * ever writes FDCAN_RXF0C / FDCAN_TXBC / FDCAN_RXESC / FDCAN_TXESC — the
+ * registers that tell the peripheral where its RX FIFO0 and TX buffers
+ * actually live and how many elements they have — so as shipped, both have
+ * zero effective hardware capacity regardless of what these SRAMCAN_*
+ * macros compute, and no frame can ever be transmitted or received. See
+ * can_lld_start() below for the corresponding register writes.
+ *
+ * This project uses only RxFIFO0 (no RxFIFO1/Rx buffers) and the TX
+ * FIFO/queue (no dedicated Tx buffers/Tx event FIFO), with zero acceptance
+ * filters (RXGFC routes every frame into FIFO0 as "non-matching"), so the
+ * filter-list regions are zero-sized and FIFO0 starts at the very
+ * beginning of each instance's message RAM. A handful of elements each is
+ * plenty for this project's traffic and leaves large headroom within the
+ * real budget for two (or a third) instance.
+ *
+ * Verified against ArduPilot's own from-scratch FDCAN driver
+ * (libraries/AP_HAL_ChibiOS/CANFDIface.cpp, setupMessageRam()), which does
+ * not use ChibiOS's canStart()/hal_can_lld.c path at all — it computes and
+ * writes RXF0C/TXBC itself for exactly this reason. This keeps the
+ * existing canStart()-based calling convention every caller in this
+ * project already depends on, just with a real, working layout. */
+#define BPRL_FDCAN_RF0_NBR  8U   /* Rx FIFO0 elements, per FDCAN instance */
+#define BPRL_FDCAN_TB_NBR   8U   /* Tx FIFO/Queue elements, per FDCAN instance */
+
 /* Filter List Standard Start Address.*/
 #define SRAMCAN_FLSSA ((uint32_t)0)
 
 /* Filter List Extended Start Address.*/
-#define SRAMCAN_FLESA ((uint32_t)(SRAMCAN_FLSSA +                           \
-                                  (STM32_FDCAN_FLS_NBR * SRAMCAN_FLS_SIZE)))
+#define SRAMCAN_FLESA ((uint32_t)0)
 
 /* RX FIFO 0 Start Address.*/
-#define SRAMCAN_RF0SA ((uint32_t)(SRAMCAN_FLESA +                           \
-                                  (STM32_FDCAN_FLE_NBR * SRAMCAN_FLE_SIZE)))
+#define SRAMCAN_RF0SA ((uint32_t)0)
 
-/* RX FIFO 1 Start Address.*/
+/* RX FIFO 1 Start Address — unused (RXGFC never routes into FIFO1), aliases
+ * the end of FIFO0 so it occupies zero additional space. */
 #define SRAMCAN_RF1SA ((uint32_t)(SRAMCAN_RF0SA +                           \
-                                  (STM32_FDCAN_RF0_NBR * SRAMCAN_RF0_SIZE)))
+                                  (BPRL_FDCAN_RF0_NBR * SRAMCAN_RF0_SIZE)))
 
-/* RX Buffer Start Address.*/
-#define SRAMCAN_RBSA  ((uint32_t)(SRAMCAN_RF1SA +                           \
-                                  (STM32_FDCAN_RF1_NBR * SRAMCAN_RF1_SIZE)))
+/* RX Buffer Start Address — unused. */
+#define SRAMCAN_RBSA  SRAMCAN_RF1SA
 
-/* TX Event FIFO Start Address.*/
-#define SRAMCAN_TEFSA ((uint32_t)(SRAMCAN_RBSA +                            \
-                                  (STM32_FDCAN_RB_NBR * SRAMCAN_RB_SIZE)))
+/* TX Event FIFO Start Address — unused. */
+#define SRAMCAN_TEFSA SRAMCAN_RF1SA
 
-/* TX Buffers Start Address.*/
-#define SRAMCAN_TBSA  ((uint32_t)(SRAMCAN_TEFSA +                           \
-                                  (STM32_FDCAN_TEF_NBR * SRAMCAN_TEF_SIZE)))
+/* TX Buffers Start Address (FIFO/queue elements start here). */
+#define SRAMCAN_TBSA  SRAMCAN_RF1SA
 
-/* Trigger Memory Start Address.*/
+/* Trigger Memory Start Address — unused, marks the end of the TX region. */
 #define SRAMCAN_TMSA  ((uint32_t)(SRAMCAN_TBSA +                            \
-                                  (STM32_FDCAN_TB_NBR * SRAMCAN_TB_SIZE)))
+                                  (BPRL_FDCAN_TB_NBR * SRAMCAN_TB_SIZE)))
 
-/* Message RAM size.*/
-#define SRAMCAN_SIZE  ((uint32_t)(SRAMCAN_TMSA +                            \
-                                  (STM32_FDCAN_TM_NBR * SRAMCAN_TM_SIZE)))
+/* Message RAM size — per FDCAN instance. Two instances (CAND1+CAND2) at
+ * this size fit comfortably within the real ~10 KB shared budget. */
+#define SRAMCAN_SIZE  SRAMCAN_TMSA
 
 #define TIMEOUT_INIT_MS                 250U
 #define TIMEOUT_CSA_MS                  250U
@@ -287,6 +316,27 @@ bool can_lld_start(CANDriver *canp) {
 	  canp->fdcan->TEST = canp->config->TEST;
   }
   canp->fdcan->RXGFC  = canp->config->RXGFC;
+
+  /* ── Message RAM: RxFIFO0 and Tx FIFO/Queue layout ──────────────────────
+   * See the SRAMCAN_* override comment near the top of this file for why
+   * this is needed at all — upstream never configures these registers.
+   * F0SA/TBSA are absolute word offsets *from SRAMCAN_BASE* (the shared
+   * message RAM all FDCAN instances live in), left-shifted by 2 to land in
+   * the register's byte-address-with-implicit-zero-low-bits field, per
+   * ArduPilot's CANFDIface.cpp::setupMessageRam() (same formula, ported
+   * here so it applies under this driver's canStart() calling convention
+   * instead of ArduPilot's own from-scratch driver). */
+  {
+    const uint32_t inst_word_off = (uint32_t)(canp->ram_base -
+                                               (uint32_t *)SRAMCAN_BASE);
+    const uint32_t rf0_word_off  = inst_word_off + (SRAMCAN_RF0SA / 4U);
+    const uint32_t tb_word_off   = inst_word_off + (SRAMCAN_TBSA  / 4U);
+
+    canp->fdcan->RXESC = 0x777U;   /* FIFO0/FIFO1/Rx-buffer element size: up to 64 bytes */
+    canp->fdcan->TXESC = 0x7U;     /* Tx buffer element size: up to 64 bytes */
+    canp->fdcan->RXF0C = (rf0_word_off << 2) | (BPRL_FDCAN_RF0_NBR << 16);
+    canp->fdcan->TXBC  = (tb_word_off  << 2) | (BPRL_FDCAN_TB_NBR  << 24);
+  }
 
   /* Start clock and disable configuration mode.*/
   canp->fdcan->CCCR &= ~(FDCAN_CCCR_CSR | FDCAN_CCCR_INIT);

@@ -94,6 +94,15 @@ void boardInit(void)
     palSetPadMode(GPIOD, 1U, PAL_MODE_ALTERNATE(9) | PAL_STM32_OSPEED_HIGHEST);
     palSetPadMode(GPIOD, 0U, PAL_MODE_ALTERNATE(9) | PAL_STM32_PUPDR_PULLUP);
 
+    /* ── FDCAN2 (PB6=TX, PB12=RX) → AF9 ───────────────────────────────
+     * Was previously left unconfigured despite LINE_CAN2_TX/RX existing
+     * in board.h and CAN.cpp starting FDCAN2 — the pins sat in their
+     * power-on-reset analog-mode state, never actually connected to the
+     * FDCAN2 peripheral, so bus 2 could not carry any signal at all
+     * regardless of external wiring. */
+    palSetPadMode(GPIOB, 6U,  PAL_MODE_ALTERNATE(9) | PAL_STM32_OSPEED_HIGHEST);
+    palSetPadMode(GPIOB, 12U, PAL_MODE_ALTERNATE(9) | PAL_STM32_PUPDR_PULLUP);
+
 /* ── SDMMC1 — microSD card → AF12 ──────────────────────────────────
      * D0=PC8, D1=PC9, D2=PC10, D3=PC11, CK=PC12, CMD=PD2
      * Data lines need pull-ups per SD spec.                             */
