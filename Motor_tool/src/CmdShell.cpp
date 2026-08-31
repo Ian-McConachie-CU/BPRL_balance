@@ -79,10 +79,13 @@ static const char *const kHelp =
     "  RMD,<id>,TORQUERAW,<ratio>            MG8016E-i6: torque command (raw -2000..2000, confirmed)\r\n"
     "  RMD,SCALE,<ratio_per_Nm>               get/set the TORQUE Nm->ratio scale\r\n"
     "  RMD,<id>,VELOCITY,<rad/s>             MG8016E-i6: velocity-loop command\r\n"
-    "  RMD,<id>,POSITION,<rad>,<maxspd>      MG8016E-i6: position command (unverified)\r\n"
+    "  RMD,<id>,POSITION,<rad>,<maxspd>      MG8016E-i6: position command, ABSOLUTE multi-turn target (0xA4)\r\n"
+    "  RMD,<id>,SINGLETURN,<rad>,<maxspd>[,<cw0/1>] MG8016E-i6: position command, ABSOLUTE single-turn 0..360deg (0xA6, default cw=1)\r\n"
+    "  RMD,<id>,INCREMENT,<rad>              MG8016E-i6: position command, RELATIVE to current position (0xA7)\r\n"
     "  RMD,<id>,STOP|OFF|RESUME              MG8016E-i6: zero out / disable / re-enable\r\n"
     "  RMD,<id>,STATUS                       MG8016E-i6: request status1 (temp/errors)\r\n"
     "  RMD,<id>,CLEARERR                     MG8016E-i6: clear latched error flags\r\n"
+    "  RMD,<id>,ENCODER                      MG8016E-i6: request current encoder position (unverified decode)\r\n"
     "  GIM,<id>,START|STOP|PAUSE              GIM6010-6: enter/exit running state / pause current command\r\n"
     "  GIM,<id>,TORQUE,<Nm>[,<duration_ms>]   GIM6010-6: torque command (real Nm, confirmed)\r\n"
     "  GIM,<id>,VELOCITY,<rad/s>[,<duration_ms>] GIM6010-6: velocity command\r\n"
@@ -206,6 +209,15 @@ static void handle_rmd(const char *rest)
         float a, s;
         bool ok = sscanf(p + 9, "%f,%f", &a, &s) == 2 && rmd_position((uint8_t)id, a, s);
         reply("RMD,%u,POSITION,%s\r\n", id, ok ? "OK" : "ERR");
+    } else if (strncmp(p, "INCREMENT,", 10) == 0) {
+        float d;
+        bool ok = sscanf(p + 10, "%f", &d) == 1 && rmd_increment_position((uint8_t)id, d);
+        reply("RMD,%u,INCREMENT,%s\r\n", id, ok ? "OK" : "ERR");
+    } else if (strncmp(p, "SINGLETURN,", 11) == 0) {
+        float a, s; int dir = 1;   // dir defaults to CW (1) if the 3rd field is omitted
+        int n = sscanf(p + 11, "%f,%f,%d", &a, &s, &dir);
+        bool ok = n >= 2 && rmd_position_single_turn((uint8_t)id, a, s, dir != 0);
+        reply("RMD,%u,SINGLETURN,%s\r\n", id, ok ? "OK" : "ERR");
     } else if (strcmp(p, "STOP") == 0) {
         reply("RMD,%u,STOP,%s\r\n", id, rmd_stop((uint8_t)id) ? "OK" : "ERR");
     } else if (strcmp(p, "OFF") == 0) {
@@ -216,6 +228,8 @@ static void handle_rmd(const char *rest)
         reply("RMD,%u,STATUS,%s\r\n", id, rmd_request_status((uint8_t)id) ? "OK" : "ERR");
     } else if (strcmp(p, "CLEARERR") == 0) {
         reply("RMD,%u,CLEARERR,%s\r\n", id, rmd_clear_error((uint8_t)id) ? "OK" : "ERR");
+    } else if (strcmp(p, "ENCODER") == 0) {
+        reply("RMD,%u,ENCODER,%s\r\n", id, rmd_read_encoder((uint8_t)id) ? "OK" : "ERR");
     } else {
         reply("RMD,%u,ERR,unknown_cmd\r\n", id);
     }

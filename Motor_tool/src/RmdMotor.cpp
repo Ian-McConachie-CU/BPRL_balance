@@ -1,5 +1,6 @@
 #include "src/RmdMotor.hpp"
 #include "ch.h"
+#include <cmath>
 #include <cstring>
 
 // Torque-ratio scale for the rmd_torque(Nm) convenience wrapper. CAN
@@ -85,6 +86,47 @@ bool rmd_position(uint8_t id, float angle_rad, float maxspeed_rads)
     return send_cmd(id, data);
 }
 
+bool rmd_position_single_turn(uint8_t id, float angle_rad, float maxspeed_rads, bool cw)
+{
+    // Single Loop Angle Control 2 (0xA6): data[1] = spinDirection
+    // (0x00=CW, 0x01=CCW — the direction it turns to REACH the target, not
+    // derived from target-vs-current like 0xA4); data[2..3] = max speed,
+    // uint16_t, 1 dps/LSB; data[4..7] = target angle, uint32_t, 0.01 deg/LSB,
+    // ABSOLUTE but SINGLE-TURN (0..359.99 deg, wraps every revolution) — the
+    // same reference frame as rmd_read_encoder()'s 0x90 reply, unlike
+    // rmd_position()'s 0xA4 which targets absolute multi-turn position.
+    angle_rad = fmodf(angle_rad, 2.0f * 3.14159265f);
+    if (angle_rad < 0.0f) angle_rad += 2.0f * 3.14159265f;
+    uint16_t maxspeed_dps = (uint16_t)(maxspeed_rads * (180.0f / 3.14159265f));
+    uint32_t angle_lsb    = (uint32_t)(angle_rad * (180.0f / 3.14159265f) * 100.0f);
+    uint8_t data[8] = {};
+    data[0] = 0xA6;
+    data[1] = cw ? 0x00U : 0x01U;
+    data[2] = (uint8_t)(maxspeed_dps & 0xFFU);
+    data[3] = (uint8_t)((maxspeed_dps >> 8) & 0xFFU);
+    data[4] = (uint8_t)(angle_lsb & 0xFFU);
+    data[5] = (uint8_t)((angle_lsb >> 8)  & 0xFFU);
+    data[6] = (uint8_t)((angle_lsb >> 16) & 0xFFU);
+    data[7] = (uint8_t)((angle_lsb >> 24) & 0xFFU);
+    return send_cmd(id, data);
+}
+
+bool rmd_increment_position(uint8_t id, float delta_rad)
+{
+    // Increment Angle Control 1 (0xA7): data[4..7] = angleIncrement,
+    // int32_t, 0.01 deg/LSB, signed — relative to current position, no
+    // speed-limit field (data[1..3] NULL). See header note for why this
+    // exists alongside rmd_position()'s absolute 0xA4.
+    int32_t angle_lsb = (int32_t)(delta_rad * (180.0f / 3.14159265f) * 100.0f);
+    uint8_t data[8] = {};
+    data[0] = 0xA7;
+    data[4] = (uint8_t)((uint32_t)angle_lsb & 0xFFU);
+    data[5] = (uint8_t)(((uint32_t)angle_lsb >> 8)  & 0xFFU);
+    data[6] = (uint8_t)(((uint32_t)angle_lsb >> 16) & 0xFFU);
+    data[7] = (uint8_t)(((uint32_t)angle_lsb >> 24) & 0xFFU);
+    return send_cmd(id, data);
+}
+
 bool rmd_stop(uint8_t id)
 {
     uint8_t data[8] = {};
@@ -120,10 +162,24 @@ bool rmd_clear_error(uint8_t id)
     return send_cmd(id, data);
 }
 
+bool rmd_read_encoder(uint8_t id)
+{
+    uint8_t data[8] = {};
+    data[0] = 0x90;
+    return send_cmd(id, data);
+}
+
 bool rmd_get_state(uint8_t id, RmdState &out)
 {
     if (!id_ok(id)) return false;
+    // s_state[id] is written field-by-field by rmd_rx_cb() on the CAN RX
+    // thread; without this, a STATUS read from the command thread can race
+    // it and see a torn mix of old/new fields (e.g. a stale pos paired with
+    // a fresh torque). Both sides are short, non-blocking memory copies, so
+    // a S-locked critical section is cheap and safe here.
+    chSysLock();
     out = s_state[id];
+    chSysUnlock();
     return true;
 }
 
@@ -148,7 +204,7 @@ static void rmd_rx_cb(CanBus bus, const CANRxFrame &f, void *ctx)
     uint8_t cmd = f.data8[0];
 
     switch (cmd) {
-    case 0xA1: case 0xA2: case 0xA3: case 0xA4: {
+    case 0xA1: case 0xA2: case 0xA3: case 0xA4: case 0xA6: case 0xA7: {
         // Confirmed by CAN PROTOCOL V2.35 (torque/speed/angle command
         // response tables — all share this layout, only the command echo
         // byte differs): byte1=temp (int8, 1C/LSB), byte2-3=torque current
@@ -160,25 +216,66 @@ static void rmd_rx_cb(CanBus bus, const CANRxFrame &f, void *ctx)
         int16_t  raw_iq    = (int16_t)((uint16_t)f.data8[2] | ((uint16_t)f.data8[3] << 8));
         int16_t  raw_speed = (int16_t)((uint16_t)f.data8[4] | ((uint16_t)f.data8[5] << 8));
         uint16_t raw_enc   = (uint16_t)f.data8[6] | ((uint16_t)f.data8[7] << 8);
-        st.torque_Nm = s_torque_scale > 0.0f ? (float)raw_iq / s_torque_scale : 0.0f;
-        st.vel_rads  = (float)raw_speed * (3.14159265f / 180.0f);
-        st.pos_rad   = (float)raw_enc * (3.14159265f / 32768.0f);
-        st.temp_C    = (float)f.data8[1];
+        float torque_Nm = s_torque_scale > 0.0f ? (float)raw_iq / s_torque_scale : 0.0f;
+        float vel_rads  = (float)raw_speed * (3.14159265f / 180.0f);
+        float pos_rad   = (float)raw_enc * (3.14159265f / 32768.0f);
+        float temp_C    = (float)f.data8[1];
+        uint32_t now    = (uint32_t)TIME_I2MS(chVTGetSystemTime());
+        // Struct is also read (as a whole) from the command thread via
+        // rmd_get_state() — lock so that read never sees a torn mix of
+        // fields from two different updates.
+        chSysLock();
+        st.torque_Nm = torque_Nm;
+        st.vel_rads  = vel_rads;
+        st.pos_rad   = pos_rad;
+        st.temp_C    = temp_C;
         st.valid     = true;
-        st.last_update_ms = (uint32_t)TIME_I2MS(chVTGetSystemTime());
+        st.last_update_ms = now;
+        chSysUnlock();
         break;
     }
     case 0x9A: {
-        // Confirmed by CAN PROTOCOL V2.35: byte1=temp (int8, 1C/LSB),
-        // byte3-4=voltage (uint16, 0.1V/LSB), byte7=errorState (single byte:
-        // bit0=under-voltage, bit3=over-temp).
+        // byte1=temp (int8, 1C/LSB), byte7=errorState — these match CAN
+        // PROTOCOL V2.35 and real hardware. The voltage field does NOT:
+        // the vendor doc says byte3-4 at 0.1V/LSB, but on real MG8016E-i6
+        // replies (poll hips, 2026-08-31) that lands 4x too low and one
+        // byte late — byte3 sat at a constant 0x10 across every unit while
+        // byte2 (documented as NULL) tracked real sensor noise. Empirically
+        // confirmed: byte2-3 at 0.01V/LSB puts all 4 hips at 41.8-42.1V
+        // against a known 41V bench supply. Trust the hardware over the doc
+        // here.
         int8_t   temp = (int8_t)f.data8[1];
-        uint16_t volt = (uint16_t)f.data8[3] | ((uint16_t)f.data8[4] << 8);
+        uint16_t volt = (uint16_t)f.data8[2] | ((uint16_t)f.data8[3] << 8);
+        uint32_t now  = (uint32_t)TIME_I2MS(chVTGetSystemTime());
+        chSysLock();
         st.temp_C      = (float)temp;
-        st.voltage_V   = (float)volt * 0.1f;
+        st.voltage_V   = (float)volt * 0.01f;
         st.error_flags = f.data8[7];
         st.valid       = true;
-        st.last_update_ms = (uint32_t)TIME_I2MS(chVTGetSystemTime());
+        st.last_update_ms = now;
+        chSysUnlock();
+        break;
+    }
+    case 0x90: {
+        // Read encoder reply. byte2-3 = encoder, uint16_t, LSB order,
+        // already relative to the drive's configured zero point — that part
+        // matches the vendor doc and is now confirmed (poll hips,
+        // 2026-08-31: byte2-3 = encoder, byte4-5 = encoderRaw, byte6-7 =
+        // encoderOffset=0, so encoder == encoderRaw - offset checks out
+        // internally). What doesn't match: the doc's generic example calls
+        // this a 14-bit field (0..16383), but this MG8016E-i6/DG80R7E's own
+        // GUI reports "Encoder Type: 16Bit Encoder" (Ktech_manual.pdf) —
+        // real raw values here go well past 16383 (e.g. 54735), and scaling
+        // as 16-bit puts every reading back in a sane 0-360deg single-turn
+        // range. Confirmed against hardware: trust 16-bit for this unit.
+        uint16_t enc = (uint16_t)f.data8[2] | ((uint16_t)f.data8[3] << 8);
+        float pos_rad = (float)enc * (2.0f * 3.14159265f / 65536.0f);
+        uint32_t now  = (uint32_t)TIME_I2MS(chVTGetSystemTime());
+        chSysLock();
+        st.pos_rad = pos_rad;
+        st.valid   = true;
+        st.last_update_ms = now;
+        chSysUnlock();
         break;
     }
     default:

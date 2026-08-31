@@ -26,17 +26,52 @@
  *     ahead of the same angle field. rmd_position() takes a speed limit, so
  *     it now correctly sends 0xA4 (was incorrectly sending 0xA3 with the
  *     0xA4 payload layout before this was confirmed).
- *   - Read state1 (0x9A) / clear error (0x9B): confirmed layout is
- *     data[1]=temp (int8, 1C/LSB), data[3:4]=voltage (uint16, 0.1V/LSB),
+ *   - Read state1 (0x9A) / clear error (0x9B): data[1]=temp (int8, 1C/LSB),
  *     data[7]=errorState (single byte: bit0=under-voltage, bit3=over-temp,
- *     all other bits invalid/unused) — this project's driver previously had
- *     the voltage/error byte positions wrong (guessed from the MyActuator
- *     layout).
+ *     all other bits invalid/unused) confirmed against real hardware.
+ *     Voltage does NOT match the vendor doc — real MG8016E-i6 replies put it
+ *     at data[2:3] (LSB order) and 0.01V/LSB, not the documented data[3:4]
+ *     at 0.1V/LSB (confirmed 2026-08-31 via poll hips against a known 41V
+ *     supply — see CAN_config.md §1.3 for the full writeup).
+ *   - Read encoder (0x90): data[2:3]=encoder, uint16_t, LSB order, already
+ *     relative to the drive's configured zero point — confirmed against
+ *     real hardware (2026-08-31), including cross-checking encoder against
+ *     encoderRaw/encoderOffset in the same reply. One correction from the
+ *     vendor doc: it's a 16-bit field here (0..65535), not the doc's generic
+ *     14-bit (0..16383) example — this MG8016E-i6/DG80R7E's own GUI reports
+ *     "Encoder Type: 16Bit Encoder" (Ktech_manual.pdf), and raw values seen
+ *     on the bus (e.g. 54735) only make sense as a single-turn 0..360deg
+ *     position at 16-bit scale.
+ *   - Single loop angle control (0xA6): data[1]=spinDirection (0x00=CW,
+ *     0x01=CCW — the direction commanded to REACH the target, not derived
+ *     from target-vs-current), data[2:3]=maxSpeed (uint16_t, 1 dps/LSB),
+ *     data[4:7]=angleControl (uint32_t, 0.01 deg/LSB, ABSOLUTE but
+ *     SINGLE-TURN: 0..359.99 deg, wraps every revolution). Added 2026-08-31
+ *     alongside 0xA7 — this is the mode that actually matches "move to X
+ *     degrees" in the same reference frame the 0x90 encoder reads, as
+ *     opposed to 0xA4's absolute multi-turn target. (0xA5 is the
+ *     no-speed-limit variant, not wired up here.)
+ *   - Increment angle control (0xA7): int32_t angleIncrement, 0.01 deg/LSB,
+ *     signed — RELATIVE move from the drive's current position, no speed
+ *     limit field (uses whatever Max Speed is configured on the drive).
+ *     Added 2026-08-31 specifically because 0xA4 (Multi Loop Angle Control)
+ *     targets an ABSOLUTE multi-turn position, which is a different
+ *     reference frame than the single-turn 0x90 encoder reading this
+ *     project uses everywhere else — after a session of hand-spinning the
+ *     shaft during testing, "target 0deg"/"target 120deg" via 0xA4 could be
+ *     asking for a real multi-turn travel of many hundreds of degrees, which
+ *     looks identical to "barely moving" if you're comparing against the
+ *     single-turn reading and waiting only a few seconds. 0xA7 sidesteps
+ *     that entirely by moving relative to wherever the shaft already is.
  *   - Also documented but not yet wired up here: open-loop control (0xA0,
- *     MS series only, not applicable to MG8016E-i6), single-loop/increment
- *     angle control (0xA5-0xA8), PID/acceleration/encoder read-write
- *     (0x30-0x34, 0x90-0x95), read state2/state3 (0x9C/0x9D), and a 4-motor
- *     broadcast torque frame (0x280, IDs 1-4 only).
+ *     MS series only, not applicable to MG8016E-i6), single-loop angle
+ *     control without a speed limit (0xA5), increment angle with speed
+ *     limit (0xA8), PID/acceleration read-write (0x30-0x34 — 0x30/0x33 sent fine over CAN
+ *     per poll hips but this drive did not reply to either, so treat those
+ *     specific reads as unsupported on this firmware rather than retrying),
+ *     write-encoder-offset (0x91), multi/single-turn angle read (0x92/0x94),
+ *     read state2/state3 (0x9C/0x9D), and a 4-motor broadcast torque frame
+ *     (0x280, IDs 1-4 only).
  */
 
 struct RmdState {
@@ -66,12 +101,15 @@ void  rmd_set_torque_scale(float ratio_per_Nm);
 float rmd_get_torque_scale(void);
 
 bool rmd_velocity(uint8_t id, float vel_rads);                   // 0xA2, clamped to +/-24000 dps
-bool rmd_position(uint8_t id, float angle_rad, float maxspeed_rads); // 0xA4 (angle + speed limit)
+bool rmd_position(uint8_t id, float angle_rad, float maxspeed_rads); // 0xA4 (angle + speed limit) — ABSOLUTE multi-turn target, see header note
+bool rmd_position_single_turn(uint8_t id, float angle_rad, float maxspeed_rads, bool cw = true); // 0xA6 — ABSOLUTE single-turn (0..360deg) target, same frame as rmd_read_encoder()
+bool rmd_increment_position(uint8_t id, float delta_rad);        // 0xA7 — RELATIVE move from current position
 bool rmd_stop(uint8_t id);      // 0x81 — zero output, stays enabled
 bool rmd_off(uint8_t id);       // 0x80 — disable closed loop
 bool rmd_resume(uint8_t id);    // 0x88 — resume closed loop after stop/off
 bool rmd_request_status(uint8_t id);  // 0x9A — request status1 (temp/voltage/error)
 bool rmd_clear_error(uint8_t id);     // 0x9B
+bool rmd_read_encoder(uint8_t id);    // 0x90 — request current single-turn encoder position (non-motion, safe; confirmed against hardware, see header note)
 
 bool rmd_get_state(uint8_t id, RmdState &out);
 

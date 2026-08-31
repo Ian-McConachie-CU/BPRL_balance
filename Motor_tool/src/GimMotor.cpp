@@ -111,7 +111,13 @@ bool gim_get_indicator(uint8_t id, uint8_t ind_id)
 bool gim_get_state(uint8_t id, GimState &out)
 {
     if (!id_ok(id)) return false;
+    // See the matching comment in RmdMotor.cpp's rmd_get_state() — s_state[id]
+    // is written field-by-field by gim_rx_cb() on the CAN RX thread, so this
+    // whole-struct read needs to be locked against it to avoid a torn mix of
+    // old/new fields.
+    chSysLock();
     out = s_state[id];
+    chSysUnlock();
     return true;
 }
 
@@ -161,6 +167,11 @@ static void gim_rx_cb(CanBus bus, const CANRxFrame &f, void *ctx)
     uint8_t  cmd = f.data8[0];
     uint32_t now = (uint32_t)TIME_I2MS(chVTGetSystemTime());
 
+    // All cases below only touch s_state[id] with plain field writes (no
+    // blocking calls), and gim_get_state() reads the whole struct at once
+    // from the command thread — lock so that read never sees a torn mix of
+    // fields from two different updates.
+    chSysLock();
     switch (cmd) {
     case 0x91:   // Start Motor ack
         st.enabled = (f.data8[1] == 0x00);   // RES==0x00 (Success)
@@ -191,6 +202,7 @@ static void gim_rx_cb(CanBus bus, const CANRxFrame &f, void *ctx)
     default:
         break;
     }
+    chSysUnlock();
 }
 
 void gim_init(void)

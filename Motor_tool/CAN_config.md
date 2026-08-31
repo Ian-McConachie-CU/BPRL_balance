@@ -115,14 +115,41 @@ byte, send `0x00`.
 | Write PID → ROM (persistent) | `0x32` | `DATA[2..7]` = same 6 PID bytes | echo |
 | Read acceleration | `0x33` | all NULL | `DATA[4:7]` = int32 Accel, 1 dps/s |
 | Write acceleration → RAM | `0x34` | `DATA[4:7]` = int32 Accel | echo |
-| Read encoder | `0x90` | all NULL | `DATA[2:3]` encoder (uint16, raw−offset), `DATA[4:5]` encoderRaw, `DATA[6:7]` encoderOffset |
+| Read encoder | `0x90` | all NULL | `DATA[2:3]` encoder (uint16, raw−offset, **16-bit** — see note below), `DATA[4:5]` encoderRaw, `DATA[6:7]` encoderOffset |
+
+> **Encoder bit-width correction (2026-08-31, confirmed against real
+> MG8016E-i6/DG80R7E hardware):** the vendor doc's example for this command
+> describes a 14-bit field (0..16383). Real replies contradict that — raw
+> values seen on the bus (e.g. `encoder=54735`) exceed 16383, and the
+> `encoder`/`encoderRaw`/`encoderOffset` triple in the same reply is
+> internally self-consistent (`encoder == encoderRaw - encoderOffset`),
+> ruling out a decode/byte-position bug. This drive's own GUI reports
+> "Encoder Type: 16Bit Encoder" (`Ktech_manual.pdf`) — treating the field as
+> 16-bit (0..65535, i.e. `angle(RAD) = raw * 2π/65536`) puts every reading
+> back in a sane single-turn 0-360° range. The 14-bit width in the vendor
+> doc's Read-encoder section is a per-model example, not a fixed constant —
+> don't assume it carries over to other LK-TECH motor models without
+> checking that model's own encoder resolution first.
 | Write encoder offset → ROM (zero point) | `0x91` | `DATA[6:7]` = uint16 encoderOffset | echo |
 | Write current position → ROM as zero | `0x19` | all NULL | `DATA[6:7]` = new encoderOffset (0 bias) |
 | Read multi-turn angle | `0x92` | all NULL | `DATA[1:7]` = int64 (7 bytes used) motorAngle, 0.01°/LSB, signed cumulative |
 | Read single-turn angle | `0x94` | all NULL | `DATA[4:7]` = uint32 circleAngle, 0.01°/LSB, 0..35999 |
 | Clear angle loop (not yet available per vendor) | `0x95` | all NULL | echo |
-| Read state 1 + error state | `0x9A` | all NULL | `DATA[1]` temp(int8,1°C/LSB), `DATA[3:4]` voltage(uint16,0.1V/LSB), `DATA[7]` errorState bitmask |
+| Read state 1 + error state | `0x9A` | all NULL | `DATA[1]` temp(int8,1°C/LSB), `DATA[2:3]` voltage(uint16,**0.01V/LSB**, see note below), `DATA[7]` errorState bitmask |
 | Clear error state | `0x9B` | all NULL | same layout as state1 (cmd byte reported as `0x9A` in the reply per the vendor doc) |
+
+> **Voltage field correction (2026-08-31, confirmed against real MG8016E-i6 hardware):**
+> the vendor PDF documents this as `DATA[3:4]` at 0.1V/LSB with `DATA[2]` as
+> NULL/reserved. Real replies from all 4 hip drives on this project's bench
+> (via `poll hips`, cross-checked byte-by-byte against a known 41V supply)
+> contradict that: `DATA[3]` sat at a constant `0x10` across every unit
+> regardless of actual bus voltage, while `DATA[2]` (documented as NULL)
+> tracked small run-to-run sensor noise exactly like a real ADC reading.
+> `DATA[2:3]` (LSB order) at **0.01V/LSB** put all 4 units at 41.8-42.1V
+> against the known 41V rail — one byte earlier and 10x finer resolution
+> than documented. `RmdMotor.cpp` and `motor_tool.py`'s `decode_rmd_9a()`
+> both use the corrected layout; trust the hardware over this PDF table for
+> this field specifically.
 | Read state 2 (temp/iq/speed/encoder) | `0x9C` | all NULL | temp(int8), iq(int16, −2048..2048), speed(int16,1dps/LSB), encoder(uint16,14bit) |
 | Read state 3 (temp/phase currents) | `0x9D` | all NULL | temp(int8), iA/iB/iC each int16, 1A/64LSB |
 
@@ -145,15 +172,43 @@ byte, send `0x00`.
   only issues per-motor commands (see `RmdMotor.cpp`) — broadcast mode is
   documented here for completeness but not implemented.
 
-### 1.5 What this project's driver actually uses
+### 1.5 Position control: three different reference frames — pick deliberately
+
+The protocol exposes three distinct position-control families, and they are
+**not interchangeable** — picking the wrong one for what you actually mean
+looks exactly like "the motor isn't responding," which cost real debugging
+time on this project (2026-08-31) before the distinction was clear:
+
+| Family | Commands | Reference frame | Direction |
+|---|---|---|---|
+| Multi Loop Angle Control | `0xA3`/`0xA4` | **Absolute, multi-turn** — a cumulative count that can be thousands of degrees after normal handling/testing | Automatic (sign of target − current) |
+| Single Loop Angle Control | `0xA5`/`0xA6` | **Absolute, single-turn** — 0..359.99°, wraps every revolution | You specify CW/CCW explicitly (`DATA[1]`) |
+| Increment Angle Control | `0xA7`/`0xA8` | **Relative** — a delta from wherever the shaft currently is | Sign of the delta |
+
+`0x90` (Read Encoder) reports a **single-turn** position — the same frame
+as Single Loop, *not* the frame `0xA3`/`0xA4` operate in. Commanding "0deg"
+via `0xA4` after the shaft has accumulated many revolutions of multi-turn
+count can mean a very large real move that looks like no response at all if
+you're watching the single-turn encoder and comparing against 0xA4's
+target. If what you actually want is "go to N degrees, where N is what
+`poll hips`/`0x90` reports," use Single Loop (`0xA6` in this firmware,
+`rmd_position_single_turn()`), not Multi Loop.
+
+### 1.6 What this project's driver actually uses
 
 See the header comment in `src/RmdMotor.hpp` for the authoritative list of
 confirmed vs. placeholder fields. Currently wired up: motor off/on/stop
 (`0x80/0x88/0x81`), torque (`0xA1`, both raw ratio and a placeholder
-Nm-scaled wrapper), speed (`0xA2`), position with speed limit (`0xA4`), read
-state1 (`0x9A`), clear error (`0x9B`). Everything else in the table above
-(PID/accel/encoder read-write, single-loop/increment angle modes, state2/3,
-broadcast) exists in the vendor spec but is not sent by this firmware today.
+Nm-scaled wrapper), speed (`0xA2`), position — multi-turn absolute
+(`0xA4`), single-turn absolute (`0xA6`), and relative (`0xA7`) — read
+state1 (`0x9A`), clear error (`0x9B`), read encoder (`0x90` — confirmed
+against real hardware, with one correction from the vendor doc; see the
+note under that row above). Everything else in the table above (PID/accel
+read-write — `0x30`/`0x33` sent fine over CAN but this drive did not reply
+to either, so those specific reads appear unsupported on this firmware —
+write-encoder-offset, no-speed-limit angle variants `0xA3`/`0xA5`/`0xA8`,
+state2/3, broadcast) exists in the vendor spec but is not sent by this
+firmware today.
 
 ---
 
