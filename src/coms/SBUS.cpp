@@ -3,26 +3,27 @@
 SbusParser g_sbus;
 
 /*
- * SBUS on USART6 (SBUSo port), SD6.
+ * SBUS on USART3 (TELEM2 port, PD9 RX), SD3.
  * 100000 baud, 8E2 (8 data bits, even parity, 2 stop bits).
- * The CubeOrangePlus PCB inverts the signal in hardware, so no RXINV needed.
+ * TELEM2 has no hardware inverter, so RXINV inverts the line in the USART.
  */
 static const SerialConfig kSbusSerialCfg = {
     100000,                                  // baud
     USART_CR1_PCE | USART_CR1_M0,           // 9-bit word (8E: M0=1 sets 9-bit mode, PCE enables parity)
-    USART_CR2_STOP_1 | USART_CR2_STOP_0,    // 2 stop bits
+    USART_CR2_STOP_1 | USART_CR2_STOP_0 |   // 2 stop bits
+    USART_CR2_RXINV,                        // invert RX line (SBUS idles low)
     0                                        // no CR3 flags
 };
 
 void SbusParser::init()
 {
-    sdStart(&SD6, &kSbusSerialCfg);
+    sdStart(&SD3, &kSbusSerialCfg);
 }
 
 void SbusParser::update()
 {
     uint8_t byte;
-    while (chnReadTimeout(&SD6, &byte, 1, TIME_IMMEDIATE) == 1) {
+    while (chnReadTimeout(&SD3, &byte, 1, TIME_IMMEDIATE) == 1) {
         switch (_state) {
         case State::WAIT_START:
             if (byte == 0x0F) {

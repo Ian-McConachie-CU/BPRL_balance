@@ -96,7 +96,7 @@ otherwise
 end
 
 %% ---- 2. velocity target + sensor model -----------------------------------
-L    = 0.12;                             % leg length held constant this run
+L    = 0.2;                             % leg length held constant this run
 fHz  = 0.1;                              % velocity-target frequency
 vAmp = 1.00;                             % velocity-target amplitude [m/s]
 vRef = @(tAbs) vAmp * sin(2*pi*fHz*tAbs);

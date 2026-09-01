@@ -19,14 +19,14 @@ comments as the source of truth if this file and the code ever disagree.
 
 ## Fleet layout (this robot, as currently configured)
 
-| Motor | Vendor model | Drive | CAN ID | Bus | Role |
-|---|---|---|---|---|---|
-| Hip 1 | LK-TECH MG8016E-i6 | DG80R/C7 | 1 | CAN bus 1 (FDCAN1) | RMD protocol |
-| Hip 2 | LK-TECH MG8016E-i6 | DG80R/C7 | 2 | CAN bus 1 (FDCAN1) | RMD protocol |
-| Hip 3 | LK-TECH MG8016E-i6 | DG80R/C7 | 3 | CAN bus 1 (FDCAN1) | RMD protocol |
-| Hip 4 | LK-TECH MG8016E-i6 | DG80R/C7 | 4 | CAN bus 1 (FDCAN1) | RMD protocol |
-| Wheel 1 | SteadyWin GIM6010-6 | SDC10x-class | 10 | CAN bus 1 (FDCAN1) | GIM protocol |
-| Wheel 2 | SteadyWin GIM6010-6 | SDC10x-class | 11 | CAN bus 1 (FDCAN1) | GIM protocol |
+| Motor | Vendor model | Drive | CAN ID | Reply ID (Host/Master CAN ID) | Bus | Role |
+|---|---|---|---|---|---|---|
+| Hip 1 | LK-TECH MG8016E-i6 | DG80R/C7 | 1 | (same, `0x140+ID` scheme) | CAN bus 1 (FDCAN1) | RMD protocol |
+| Hip 2 | LK-TECH MG8016E-i6 | DG80R/C7 | 2 | (same, `0x140+ID` scheme) | CAN bus 1 (FDCAN1) | RMD protocol |
+| Hip 3 | LK-TECH MG8016E-i6 | DG80R/C7 | 3 | (same, `0x140+ID` scheme) | CAN bus 1 (FDCAN1) | RMD protocol |
+| Hip 4 | LK-TECH MG8016E-i6 | DG80R/C7 | 4 | (same, `0x140+ID` scheme) | CAN bus 1 (FDCAN1) | RMD protocol |
+| Wheel 1 | SteadyWin GIM6010-6 | SDC10x-class | 15 | **16** | CAN bus 1 (FDCAN1) | GIM protocol |
+| Wheel 2 | SteadyWin GIM6010-6 | SDC10x-class | 20 | **21** | CAN bus 1 (FDCAN1) | GIM protocol |
 
 All six motors share **one physical CAN bus** (`BUS,1` in this tool / bus 1 in
 `motor_tool.py`). CAN bus 2 (FDCAN2) is reserved in this firmware for the
@@ -423,15 +423,24 @@ during bring-up rather than trusting it blind.
   the physical ends of the backbone should have their 120 Ω terminator
   enabled (LK-TECH: DIP switch `R`; GIM: check its own config/jumper) — not
   every drop. Enabling it on every node will kill signal integrity.
-- **Shared bus:** RMD (1–4) and GIM (10–11) IDs don't collide with each
-  other or with the tool's own `0x140+ID`/GIM-ID addressing, so they can
-  coexist on one physical bus (`BUS,1`) as currently wired. CAN bus 2 is
-  reserved for the IMX5 IMU only in this firmware.
+- **Shared bus:** RMD (1–4) and GIM (15, 20 CAN IDs; 16, 21 reply IDs) don't
+  collide with each other or with the tool's own `0x140+ID` addressing, so
+  they coexist on one physical bus (`BUS,1`) as currently wired. CAN bus 2
+  is reserved for the IMX5 IMU only in this firmware.
 - **Reply-ID assumptions:** LK-TECH's `0x140+ID` reply address is confirmed
-  against hardware; GIM's same-ID-as-command reply address is inferred, not
-  vendor-stated — treat GIM silence as ambiguous (could be wrong reply-ID
-  assumption, not necessarily a wiring fault) until confirmed with
-  `CAN,monitor`.
+  against hardware. GIM's reply address is **not** simply "same ID as the
+  command" — confirmed wrong 2026-08-31 via `poll_wheels`: a GIM configured
+  with CAN ID 20 / Host-Master CAN ID (ConfID 0x13) 21 replies on SID 21,
+  with total silence on SID 20 (the ID commands were sent to). Commands are
+  still sent to the motor's own CAN ID; only the reply-listening address
+  differs. This project's firmware now tracks a per-motor reply ID
+  (`gim_set_reply_id()` / `GIM,<id>,MASTERID,<reply_id>`) rather than
+  assuming they match — `motor_tool.py`'s `ensure_gim_reply_ids()` pushes
+  the known mapping (`DEFAULT_GIM_MASTER_IDS`) before every poll. **Check
+  each GIM's actual CAN ID vs. Host/Master CAN ID via the GUI before
+  assuming they're equal** — this project's assumed default is CAN ID 15 →
+  reply 16, CAN ID 20 → reply 21, but that's this robot's specific
+  configuration, not a protocol constant.
 - **41 V bench supply:** fine for the DG80R/C7 (12–60 V rated); GIM6010-6
   drive voltage range isn't in the provided doc — if a GIM won't Start,
   check its Over/Under Voltage Threshold config (0x16/0x17) and Get Fault

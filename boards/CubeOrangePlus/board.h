@@ -91,8 +91,10 @@
 #define LINE_PERIPH_5V_EN       PAL_LINE(GPIOA, 8U)   /* nVDD_5V_PERIPH_EN (active LOW) */
 #define LINE_PWM_VOLT_SEL       PAL_LINE(GPIOB, 4U)   /* PWM_VOLT_SEL      (HIGH = 3.3 V) */
 
-/* ── RC input ────────────────────────────────────────────────────────────────── */
-#define LINE_RC_INPUT           PAL_LINE(GPIOC, 7U)
+/* ── RC input ─────────────────────────────────────────────────────────────────
+ * SBUS in on TELEM2 (USART3 RX). PC7/USART6 is the internal FMU<->IO
+ * co-processor link, not an external pin — see src/coms/SBUS.hpp. */
+#define LINE_RC_INPUT           PAL_LINE(GPIOD, 9U)
 
 #if !defined(_FROM_ASM_)
 #ifdef __cplusplus

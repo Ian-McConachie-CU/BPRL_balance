@@ -13,13 +13,17 @@
  * Frame (CAN): no header, 8-byte payload, standard frame, LSB byte order,
  * baud <1Mbps (drive-configurable — verify against this drive's actual
  * setting; default per the drive's own docs, not restated here).
- * Arbitration ID: "customized" per motor (its configured CAN ID). The spec
- * only documents a response identifier scheme for RS485 (separate 4-byte
- * header with an explicit ID field); for CAN it's silent. This driver
- * assumes — by analogy with RS485's "ID = receiver on the bus" framing,
- * and matching the LK-TECH RMD driver's now-confirmed behavior — that the
- * reply arrives on the SAME arbitration ID as the command. Verify with the
- * sniffer (CAN,monitor) before trusting it if something looks wrong.
+ * Arbitration ID: commands are sent to the motor's own configured "CAN ID"
+ * (ConfType 0x00 ConfID 0x12). REPLIES DO NOT necessarily land on that same
+ * ID — confirmed 2026-08-31 via poll_wheels (motor_tool.py) against real
+ * hardware: a GIM6010-6 configured with CAN ID 20 / Host-Master CAN ID
+ * (ConfID 0x13) 21 replied on SID 21, with total silence on SID 20, where
+ * this driver had been listening the whole time. This driver's old
+ * same-ID-as-command assumption is only correct when Master CAN ID happens
+ * to equal CAN ID — use gim_set_reply_id() whenever they're configured
+ * differently, which needs to be checked per motor, not assumed.
+ * Commands are still SENT to the motor's own CAN ID either way — only the
+ * reply-listening address is affected.
  *
  * Command bytes used here (see the spec for the full list — configuration,
  * parameter, calibration, and firmware-update commands exist but aren't
@@ -56,6 +60,14 @@ struct GimState {
 void gim_init(void);           // subscribes to CAN RX; call once after can_drv_init()
 void gim_set_bus(CanBus bus);
 CanBus gim_get_bus(void);
+
+// Tell the driver which arbitration ID this motor's REPLIES actually
+// arrive on, if different from its own CAN ID — see the header comment
+// above. reply_id=0 (the default for every id) means "same as the motor's
+// own CAN ID", preserving old behavior until this is set. Commands are
+// still sent to `id` regardless of this setting.
+void    gim_set_reply_id(uint8_t id, uint8_t reply_id);
+uint8_t gim_get_reply_id(uint8_t id);   // returns id itself if never overridden
 
 // Needed to decode the packed torque field into Nm (spec 3.2.7). Defaults
 // are placeholders — read the real values with a Retrieve Configuration

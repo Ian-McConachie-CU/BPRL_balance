@@ -62,7 +62,7 @@ BPRL_balance/
 │   │   ├── SPI.hpp/.cpp      SPI bus init, ICM-20948 / ICM-45686 drivers
 │   │   ├── CAN.hpp/.cpp      FDCAN1 + FDCAN2 dual-bus driver, device callback table
 │   │   ├── CANMotor.hpp/.cpp 6-motor CAN abstraction (RMD + SDC102 protocols)
-│   │   ├── Radio.hpp/.cpp    SBUS radio input (USART6, SBUSo port)
+│   │   ├── Radio.hpp/.cpp    SBUS radio input (USART3, TELEM2 port)
 │   │   ├── SBUS.hpp/.cpp     100000 baud 8E2 parser for 16-channel SBUS frames
 │   │   ├── ICM20948.hpp/.cpp InvenSense ICM-20948 9-DOF driver
 │   │   └── ICM45686.hpp/.cpp TDK ICM-45686 6-DOF driver
@@ -111,7 +111,7 @@ BPRL_balance/
 | **Board** | CubePilot CubeOrange+ |
 | **CAN bus 1 (FDCAN1)** | 6 motors + strain sensor + IMX5 INS |
 | **CAN bus 2 (FDCAN2)** | CAN IMU + current sensor (TBD) |
-| **Radio** | SBUS on SBUSo port (USART6/PC7, 100000 baud 8E2) |
+| **Radio** | SBUS on TELEM2 port (USART3/PD9, 100000 baud 8E2, RXINV) |
 | **Logging** | microSD via SDMMC1 (SPI1/SPI4 for IMUs) |
 | **Debug** | USB CDC-ACM (`/dev/ttyACMx`) |
 

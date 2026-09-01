@@ -10,7 +10,7 @@
  *   src/coms/SPI.*               ICM-20948/20602 onboard IMU drivers.
  *   src/coms/CAN.*               FDCAN1 + FDCAN2 drivers, device registration.
  *   src/coms/CANMotor.*          6-motor CAN abstraction (RMD + SDC102).
- *   src/coms/Radio.*             SBUS radio input (USART6, SBUSo port).
+ *   src/coms/Radio.*             SBUS radio input (USART3, TELEM2 port).
  *   src/controllers/             RobotStateMachine, BalanceController, PID.
  *   src/state_estimator/         3-lane EKF.
  *
@@ -100,7 +100,7 @@ int main(void)
     can_motor_register(5, CAN_MOTOR_SDC102);  // wheel L
     can_motor_register(6, CAN_MOTOR_SDC102);  // wheel R
 
-    radio_input_init();   // SBUS on USART6 (SBUSo port, 100000 baud 8E2)
+    radio_input_init();   // SBUS on USART3 (TELEM2 port, 100000 baud 8E2, RXINV)
 
     threads_start(kRates);
 

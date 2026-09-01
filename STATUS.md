@@ -19,7 +19,7 @@
 | Added | Notes |
 |---|---|
 | FDCAN2 (bus 2) | Enabled in `mcuconf.h`; both buses start at 1 Mbit/s |
-| USART6 for SBUS | Enabled in `mcuconf.h`; 100000 baud 8E2, hardware-inverted on CubeOrangePlus PCB |
+| USART3 (TELEM2) for SBUS | Enabled in `mcuconf.h`; 100000 baud 8E2, RXINV (moved off USART6 — that pin is the internal FMU↔IO-coprocessor link on real Cube hardware, not an external connector) |
 | IMX5 INS on CAN bus 2 | Standard 11-bit IDs 0x01–0x04; quaternion + rates → `g_can_imu` |
 | Matek CAN-L4-BM power monitor | DroneCAN BatteryInfo (DTID 1092); masked EID match; voltage + current → `g_power` |
 | 6 CAN motors on bus 1 | IDs 1–4 hip (RMD/LKMTECH MG8016E-i6), IDs 5–6 wheel (SDC102/Steadywin GIM6010-6) |
@@ -29,7 +29,7 @@
 - `src/controllers/BalanceController` — stub; outputs zero torques until balance logic is written
 - `src/coms/CANMotor` — abstracts RMD and SDC102 protocols; `can_motor_set_torque()` / `can_motor_get_state()`
 - `src/coms/CANPower` — DroneCAN BatteryInfo parser with float16→float32 conversion
-- `src/coms/SBUS` — real SD6 implementation (was a stub from BPRL_flight)
+- `src/coms/SBUS` — real SD3 implementation (was a stub from BPRL_flight)
 - `src/RobotState.hpp` — `InputIdx::MODE_SW` replaces `FLIGHT_MODE`
 - 3-lane EKF (16-state) carried over unchanged
 
@@ -60,7 +60,7 @@
 - [ ] Watchdog does not trip under normal operation
 
 ### SBUS radio
-- [ ] SBUS receiver connected to SBUSo port; `$RCIN` stream shows live channel values
+- [ ] SBUS receiver connected to TELEM2 port; `$RCIN` stream shows live channel values
 - [ ] `InputIdx::MODE_SW` (channel 4) reads correctly from the mode switch
 - [ ] Frame-lost and failsafe flags set correctly when receiver is powered off
 

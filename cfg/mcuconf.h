@@ -371,10 +371,10 @@
  */
 #define STM32_SERIAL_USE_USART1             FALSE
 #define STM32_SERIAL_USE_USART2             TRUE   /* TELEM1 — telemetry/debug (SD2) */
-#define STM32_SERIAL_USE_USART3             TRUE   /* TELEM2 — future sensor (SD3) */
+#define STM32_SERIAL_USE_USART3             TRUE   /* TELEM2 — SBUS RC input (SD3, 100000 baud 8E2, RXINV) */
 #define STM32_SERIAL_USE_UART4              FALSE
 #define STM32_SERIAL_USE_UART5              FALSE
-#define STM32_SERIAL_USE_USART6             TRUE   /* SBUSo — SBUS RC input (SD6, 100000 baud 8E2) */
+#define STM32_SERIAL_USE_USART6             FALSE  /* Internal FMU<->IO-coprocessor link (PC7) — not an external pin, unused by this firmware */
 #define STM32_SERIAL_USE_UART7              FALSE
 #define STM32_SERIAL_USE_UART8              FALSE
 #define STM32_SERIAL_USE_LPUART1            FALSE

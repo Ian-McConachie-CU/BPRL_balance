@@ -85,13 +85,14 @@ static const char *const kHelp =
     "  RMD,<id>,STOP|OFF|RESUME              MG8016E-i6: zero out / disable / re-enable\r\n"
     "  RMD,<id>,STATUS                       MG8016E-i6: request status1 (temp/errors)\r\n"
     "  RMD,<id>,CLEARERR                     MG8016E-i6: clear latched error flags\r\n"
-    "  RMD,<id>,ENCODER                      MG8016E-i6: request current encoder position (unverified decode)\r\n"
+    "  RMD,<id>,ENCODER                      MG8016E-i6: request current encoder position (confirmed, motor-side, 16-bit)\r\n"
     "  GIM,<id>,START|STOP|PAUSE              GIM6010-6: enter/exit running state / pause current command\r\n"
     "  GIM,<id>,TORQUE,<Nm>[,<duration_ms>]   GIM6010-6: torque command (real Nm, confirmed)\r\n"
     "  GIM,<id>,VELOCITY,<rad/s>[,<duration_ms>] GIM6010-6: velocity command\r\n"
     "  GIM,<id>,POSITION,<rad>[,<duration_ms>]   GIM6010-6: position command\r\n"
     "  GIM,<id>,FAULT | ACKFAULT              GIM6010-6: request/clear fault status\r\n"
     "  GIM,<id>,IND,<ind_id>                  GIM6010-6: request one runtime indicator (0=bus V, 2=motor temp, ...)\r\n"
+    "  GIM,<id>,MASTERID,<reply_id>           GIM6010-6: set the SID this id's replies actually arrive on (Host/Master CAN ID)\r\n"
     "  GIM,LIMIT,<Nm>                        set/query the GIM torque clamp\r\n"
     "  GIM,KT,<Nm_per_A> / GIM,GEAR,<ratio>  set the constants used to decode GIM torque feedback\r\n"
     "  IMU,status                            IMX5 INS decode (bus 2, known-good reference device)\r\n";
@@ -301,6 +302,10 @@ static void handle_gim(const char *rest)
         bool ok = sscanf(p + 4, "%u", &ind_id) == 1
                   && gim_get_indicator((uint8_t)id, (uint8_t)ind_id);
         reply("GIM,%u,IND,%s\r\n", id, ok ? "OK" : "ERR");
+    } else if (strncmp(p, "MASTERID,", 9) == 0) {
+        unsigned reply_id;
+        if (sscanf(p + 9, "%u", &reply_id) == 1) gim_set_reply_id((uint8_t)id, (uint8_t)reply_id);
+        reply("GIM,%u,MASTERID,%u\r\n", id, (unsigned)gim_get_reply_id((uint8_t)id));
     } else {
         reply("GIM,%u,ERR,unknown_cmd\r\n", id);
     }

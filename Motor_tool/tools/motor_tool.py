@@ -18,6 +18,7 @@ import argparse
 import glob
 import math
 import re
+import struct
 import sys
 import time
 from typing import Optional
@@ -110,12 +111,49 @@ def read_lines_until(ser: serial.Serial, end_marker: Optional[str], timeout: flo
     return lines
 
 
+def _non_mon(lines):
+    """Drop raw MON,... frame lines from a captured line list before
+    showing it in an error message. CAN,monitor captures BOTH buses
+    indiscriminately, and bus 2 (the IMX5 IMU) streams continuously at a
+    high rate -- while a monitor session is active for an unrelated bus-1
+    diagnostic, its output gets buried in IMU noise otherwise. This is only
+    for what gets shown to the user; callers that need the raw MON lines
+    for actual bus-1 traffic analysis (poll_hips/poll_gim/poll_wheels) keep
+    working from their own unfiltered capture."""
+    return [l for l in lines if not l.startswith("MON,")]
+
+
 # ── Commands ────────────────────────────────────────────────────────────────
 
 # Defaults match this robot's current layout: 4 RMD hip motors (IDs 1-4),
-# 2 GIM wheel motors (IDs 10-11), all on bus 1.
+# 2 GIM wheel motors, all on bus 1. Each GIM wheel's CAN ID and Host/Master
+# CAN ID are configured as DIFFERENT values (confirmed 2026-08-31 via
+# poll_wheels): wheel 1 = CAN ID 15 / reply SID 16 (moved from 10/11),
+# wheel 2 = CAN ID 20 / reply SID 21. DEFAULT_GIM_IDS lists
+# the CAN IDs (what commands are sent to) -- 16 is NOT a second motor, it's
+# wheel 1's reply address.
 DEFAULT_RMD_IDS = [1, 2, 3, 4]
-DEFAULT_GIM_IDS = [10, 11]
+DEFAULT_GIM_IDS = [15, 20]
+DEFAULT_GIM_MASTER_IDS = {15: 16, 20: 21}   # CAN ID -> reply SID, per gim_set_reply_id()
+
+
+def ensure_gim_reply_ids(ser, gim_ids, master_map=None):
+    """Push gim_set_reply_id() to the firmware for every id in gim_ids that
+    has a known Host/Master CAN ID mapping. Without this, the firmware
+    listens for a GIM's reply on its own CAN ID, which is wrong whenever
+    Master CAN ID differs (confirmed 2026-08-31 via poll_wheels) -- every
+    GIM,<id>,... request would ack fine (frame sent OK) but never populate
+    STATUS, since the actual reply lands on a SID nothing was watching.
+    Cheap and idempotent, so it's safe to call before every poll — this
+    also makes the mapping self-healing across firmware reboots/reflashes
+    without a separate manual setup step."""
+    master_map = master_map or DEFAULT_GIM_MASTER_IDS
+    for i in gim_ids:
+        master_id = master_map.get(i)
+        if master_id is None:
+            continue
+        send(ser, f"GIM,{i},MASTERID,{master_id}")
+        read_lines_until(ser, None, timeout=0.2)
 
 
 def cmd_poll(ser, rmd_ids, gim_ids, retries=2):
@@ -132,6 +170,7 @@ def cmd_poll(ser, rmd_ids, gim_ids, retries=2):
     look flaky — the exact same motor could appear or not depending on
     timing alone), this retries only the ids that are still missing after
     each STATUS snapshot, and reports plainly if an id never answers."""
+    ensure_gim_reply_ids(ser, gim_ids)
     pending_rmd = set(rmd_ids)
     pending_gim = set(gim_ids)
     seen_rmd, seen_gim = set(), set()
@@ -151,7 +190,7 @@ def cmd_poll(ser, rmd_ids, gim_ids, retries=2):
                 lines = read_lines_until(ser, None, timeout=0.3)
                 if not any(f"{cmd}," in l and l.endswith(",OK") for l in lines):
                     console.print(f"[yellow]  RMD {i} {cmd.split(',')[-1]}: request not acked "
-                                   f"({lines or 'no reply at all'})[/yellow]")
+                                   f"({_non_mon(lines) or 'no reply at all'})[/yellow]")
 
         if attempt == 1:
             console.print(f"[dim]Polling GIM IDs {sorted(pending_gim)} (fault + indicators)...[/dim]")
@@ -161,7 +200,7 @@ def cmd_poll(ser, rmd_ids, gim_ids, retries=2):
                 lines = read_lines_until(ser, None, timeout=0.3)
                 if not any(",OK" in l for l in lines):
                     console.print(f"[yellow]  GIM {i} {cmd.split(',')[-1]}: request not acked "
-                                   f"({lines or 'no reply at all'})[/yellow]")
+                                   f"({_non_mon(lines) or 'no reply at all'})[/yellow]")
 
         time.sleep(0.15)
         new_rmd, new_gim = cmd_status(ser)
@@ -447,6 +486,238 @@ def cmd_poll_hips(ser, rmd_ids=None):
 
     console.print(f"\n[dim]Run 'status' to see these same IDs' cached STATUS,RMD row for "
                   f"comparison against the decode above.[/dim]")
+
+
+# Command byte -> name, for the GIM side (see ../CAN_config.md §2.2).
+GIM_CMD_NAMES = {
+    0x91: "StartMotor", 0x92: "StopMotor", 0x97: "StopControl",
+    0x93: "TorqueCtrl", 0x94: "SpeedCtrl", 0x95: "PositionCtrl",
+    0xB2: "GetFault", 0xB3: "AckFault", 0xB4: "RetrieveIndicator",
+}
+
+
+def decode_gim_b2(data):
+    """Decode a 0xB2 (Get Fault) reply per CAN_config.md §2.7:
+    DATA[1]=RES, DATA[2]=FaultNo bitmask."""
+    return data[1], data[2]
+
+
+def decode_gim_b4(data):
+    """Decode a 0xB4 (Retrieve Indicator) reply per CAN_config.md §2.7:
+    DATA[1]=IndID (echoed), DATA[2]=RES, DATA[4:7]=IEEE float value, LSB
+    (little-endian) byte order — matches GimMotor.cpp's memcpy decode on
+    this little-endian STM32."""
+    ind_id, res = data[1], data[2]
+    val = struct.unpack("<f", bytes(data[4:8]))[0]
+    return ind_id, res, val
+
+
+def cmd_poll_gim(ser, gim_ids=None):
+    """Poll the GIM wheel motors with the CAN monitor running — the same
+    raw-byte methodology as poll_hips, applied to GIM. Sends 0xB2 (Get
+    Fault) and 0xB4 (Retrieve Indicator: bus voltage, motor temp) per id,
+    all non-motion, safe reads, and shows exactly what came back (if
+    anything) on each polled CAN ID's arbitration ID *and* its configured
+    reply ID (Host/Master CAN ID), since those are confirmed to differ on
+    this project's wheels (2026-08-31, via poll_wheels).
+
+    This also calls ensure_gim_reply_ids() first, so the firmware itself
+    starts correctly attributing these replies to the right id in its own
+    STATUS cache — not just this command's own raw capture.
+    """
+    ids = gim_ids or DEFAULT_GIM_IDS
+    reply_of = {i: DEFAULT_GIM_MASTER_IDS.get(i, i) for i in ids}
+    console.print(f"[bold]poll gim[/bold] — GIM IDs {ids} "
+                  f"(reply IDs {[reply_of[i] for i in ids]}), watching raw bus-1 traffic\n")
+
+    ensure_gim_reply_ids(ser, ids)
+
+    send(ser, "CAN,monitor,start")
+    read_lines_until(ser, None, timeout=0.3)
+
+    all_lines = []
+    for i in ids:
+        for cmd, label in ((f"GIM,{i},FAULT", "FAULT"),
+                            (f"GIM,{i},IND,0", "IND 0 (bus V)"),
+                            (f"GIM,{i},IND,2", "IND 2 (motor temp)")):
+            send(ser, cmd)
+            lines = read_lines_until(ser, None, timeout=0.4)
+            all_lines.extend(lines)
+            if not any(l.startswith(f"GIM,{i},") and l.endswith(",OK") for l in lines):
+                console.print(f"[red]  GIM {i} {label}: request send failed "
+                               f"({_non_mon(lines) or 'no reply at all'})[/red]")
+
+    send(ser, "CAN,monitor,stop")
+    all_lines.extend(read_lines_until(ser, None, timeout=0.3))
+
+    # Parse every MON,... line captured and bucket by which polled GIM CAN
+    # ID's *or its reply ID's* arbitration ID it landed on -- confirmed
+    # (2026-08-31) that these can legitimately differ per motor.
+    watch_ids = sorted(set(ids) | set(reply_of.values()))
+    frames_by_id = {i: [] for i in watch_ids}
+    other_bus1_ids = {}
+    for line in all_lines:
+        if not line.startswith("MON,"):
+            continue
+        parts = line[4:].split(",")
+        if len(parts) < 5:
+            continue
+        t_ms, bus, cid_str, _is_ext, dlc = parts[:5]
+        if bus != "1":
+            continue
+        try:
+            cid = int(cid_str, 16)
+            data = [int(x, 16) for x in parts[5:5 + int(dlc)]]
+        except ValueError:
+            continue
+        if cid in frames_by_id:
+            frames_by_id[cid].append((int(t_ms), data))
+        else:
+            other_bus1_ids[cid] = other_bus1_ids.get(cid, 0) + 1
+
+    console.print("[bold]Raw CAN traffic per GIM motor[/bold]")
+    for i in ids:
+        rid = reply_of[i]
+        label = f"CAN ID {i}" if rid == i else f"CAN ID {i} / reply ID {rid}"
+        console.print(f"\n[cyan]{label}[/cyan]:")
+        frames = frames_by_id[i] + (frames_by_id[rid] if rid != i else [])
+        frames.sort(key=lambda td: td[0])
+        if not frames:
+            console.print(f"  [red]No frame seen on either ID during the request window. "
+                           f"Check power/CAN wiring/termination for this drive specifically.[/red]")
+            continue
+        for t_ms, data in frames:
+            hexs = " ".join(f"{b:02x}" for b in data)
+            cmd = data[0] if data else None
+            name = GIM_CMD_NAMES.get(cmd, f"0x{cmd:02x}" if cmd is not None else "?")
+            tag = ""
+            if len(data) == 8 and all(b == 0 for b in data[1:]):
+                tag = "  [dim](all-zero payload after the command byte — this is what OUR " \
+                      "own request looks like, not necessarily a reply)[/dim]"
+            console.print(f"  t={t_ms:>8}ms  dlc={len(data)}  bytes=<{hexs}>  cmd={name}{tag}")
+            if cmd == 0xB2 and len(data) == 8:
+                res, fault = decode_gim_b2(data)
+                console.print(f"    decoded: RES=0x{res:02x} fault=0x{fault:02x}")
+            elif cmd == 0xB4 and len(data) == 8:
+                ind_id, res, val = decode_gim_b4(data)
+                console.print(f"    decoded: IndID={ind_id} RES=0x{res:02x} value={val:.3f}")
+        if len(frames) == 1 and all(b == 0 for b in frames[0][1][1:]):
+            console.print(f"  [yellow]Only one frame seen for this ID, and it looks like our "
+                           f"own request echoed back — no distinct reply from the drive itself.[/yellow]")
+
+    if other_bus1_ids:
+        console.print(f"\n[dim]Other bus-1 traffic seen (not one of the polled GIM IDs): "
+                       + ", ".join(f"0x{cid:03x} x{n}" for cid, n in other_bus1_ids.items()) + "[/dim]")
+
+    console.print(f"\n[dim]Run 'status' to see these same IDs' cached STATUS,GIM row for "
+                  f"comparison against the decode above.[/dim]")
+
+
+def cmd_poll_wheels(ser, pairs=None):
+    """Poll GIM wheel motors whose CAN ID and Host/Master CAN ID are
+    configured as DIFFERENT values, checking BOTH ids per wheel for a
+    reply. Commands are always sent to the CAN ID (that's the motor's own
+    listening address, per the protocol) — this reports which of {CAN ID,
+    Master CAN ID} actually shows a reply frame, settling empirically
+    whether GIM replies land on the id you sent to or a separately
+    configured master/host id.
+
+    pairs: list of (can_id, master_id) tuples. Defaults to this project's
+    current wheel configuration: wheel 1 = CAN ID 15 / Master CAN ID 16,
+    wheel 2 = CAN ID 20 / Master CAN ID 21.
+    """
+    pairs = pairs or [(15, 16), (20, 21)]
+    watch_ids = sorted({i for pair in pairs for i in pair})
+    console.print(f"[bold]poll wheels[/bold] — pairs {pairs}, watching IDs {watch_ids} on bus 1\n")
+
+    send(ser, "CAN,monitor,start")
+    read_lines_until(ser, None, timeout=0.3)
+
+    all_lines = []
+    for can_id, _master_id in pairs:
+        for cmd, label in ((f"GIM,{can_id},FAULT", "FAULT"),
+                            (f"GIM,{can_id},IND,0", "IND 0 (bus V)"),
+                            (f"GIM,{can_id},IND,2", "IND 2 (motor temp)")):
+            send(ser, cmd)
+            lines = read_lines_until(ser, None, timeout=0.4)
+            all_lines.extend(lines)
+            if not any(l.startswith(f"GIM,{can_id},") and l.endswith(",OK") for l in lines):
+                console.print(f"[red]  CAN ID {can_id} {label}: request send failed "
+                               f"({_non_mon(lines) or 'no reply at all'})[/red]")
+
+    send(ser, "CAN,monitor,stop")
+    all_lines.extend(read_lines_until(ser, None, timeout=0.3))
+
+    frames_by_id = {i: [] for i in watch_ids}
+    other_bus1_ids = {}
+    for line in all_lines:
+        if not line.startswith("MON,"):
+            continue
+        parts = line[4:].split(",")
+        if len(parts) < 5:
+            continue
+        t_ms, bus, cid_str, _is_ext, dlc = parts[:5]
+        if bus != "1":
+            continue
+        try:
+            cid = int(cid_str, 16)
+            data = [int(x, 16) for x in parts[5:5 + int(dlc)]]
+        except ValueError:
+            continue
+        if cid in frames_by_id:
+            frames_by_id[cid].append((int(t_ms), data))
+        else:
+            other_bus1_ids[cid] = other_bus1_ids.get(cid, 0) + 1
+
+    def print_frames(i):
+        frames = frames_by_id[i]
+        if not frames:
+            console.print(f"    [dim]no frames seen[/dim]")
+            return frames
+        for t_ms, data in frames:
+            hexs = " ".join(f"{b:02x}" for b in data)
+            cmd = data[0] if data else None
+            name = GIM_CMD_NAMES.get(cmd, f"0x{cmd:02x}" if cmd is not None else "?")
+            tag = ""
+            if len(data) == 8 and all(b == 0 for b in data[1:]):
+                tag = "  [dim](looks like our own echoed request)[/dim]"
+            console.print(f"    t={t_ms:>8}ms  bytes=<{hexs}>  cmd={name}{tag}")
+            if cmd == 0xB2 and len(data) == 8:
+                res, fault = decode_gim_b2(data)
+                console.print(f"      decoded: RES=0x{res:02x} fault=0x{fault:02x}")
+            elif cmd == 0xB4 and len(data) == 8:
+                ind_id, res, val = decode_gim_b4(data)
+                console.print(f"      decoded: IndID={ind_id} RES=0x{res:02x} value={val:.3f}")
+        return frames
+
+    def has_distinct_reply(frames):
+        return any(len(d) == 8 and not all(b == 0 for b in d[1:]) for _, d in frames)
+
+    for can_id, master_id in pairs:
+        console.print(f"\n[bold cyan]Wheel: CAN ID {can_id} / Master CAN ID {master_id}[/bold cyan]")
+        console.print(f"  [CAN ID] 0x{can_id:03x}:")
+        can_frames = print_frames(can_id)
+        console.print(f"  [Master CAN ID] 0x{master_id:03x}:")
+        master_frames = print_frames(master_id)
+
+        can_reply = has_distinct_reply(can_frames)
+        master_reply = has_distinct_reply(master_frames)
+        if master_reply and not can_reply:
+            console.print(f"  [green]VERDICT: replies land on Master CAN ID {master_id}, "
+                           f"not CAN ID {can_id}.[/green]")
+        elif can_reply and not master_reply:
+            console.print(f"  [green]VERDICT: replies land on CAN ID {can_id}, as this tool "
+                           f"has been assuming for GIM so far.[/green]")
+        elif can_reply and master_reply:
+            console.print(f"  [yellow]VERDICT: distinct-looking replies seen on BOTH ids — "
+                           f"unusual, look at the raw bytes above.[/yellow]")
+        else:
+            console.print(f"  [red]VERDICT: no reply seen on either id — check power/wiring "
+                           f"for this specific wheel (expected if it's not connected right now).[/red]")
+
+    if other_bus1_ids:
+        console.print(f"\n[dim]Other bus-1 traffic seen (not one of the watched IDs): "
+                       + ", ".join(f"0x{cid:03x} x{n}" for cid, n in other_bus1_ids.items()) + "[/dim]")
 
 
 _RMD_STATUS_RE = re.compile(
@@ -818,6 +1089,8 @@ def print_help():
   status                                  print all known motor state
   poll [rmd_id ...]                       actively ping RMD ids (default 1-4) + scan for GIM ids, then show status
   poll hips [rmd_id ...]                  poll RMD hips with CAN monitor running; show raw bytes + independent decode per ID
+  poll gim [gim_id ...]                   poll GIM wheels with CAN monitor running; show raw bytes + independent decode per ID
+  poll wheels [can_id master_id ...]      check BOTH CAN ID and Master CAN ID per wheel for replies (default: 15/16, 20/21)
   test hips [rmd_id ...]                  MOVES hips (one at a time) to 0deg then 120deg; confirms before moving anything
   test drift [rmd_id ...]                 no motion — samples encoder for 5s, reports if it moves while nominally still
   scan [seconds]                          ID scanner on the active bus
@@ -846,6 +1119,7 @@ def print_help():
   gim <id> position <rad> [duration_ms]    GIM6010-6 position command
   gim <id> fault | ackfault                GIM6010-6 request/clear fault status
   gim <id> ind <ind_id>                    GIM6010-6 request one runtime indicator (0=bus V, 2=motor temp, 14=speed RPM, ...)
+  gim <id> masterid <reply_id>             set the SID this id's replies actually arrive on (Host/Master CAN ID, confirmed to differ per motor)
   gim limit [Nm]                           get/set the GIM torque clamp
   gim kt [Nm_per_A] / gim gear [ratio]     set the constants used to decode GIM torque feedback
 
@@ -877,6 +1151,19 @@ def repl(ser):
         elif cmd == "poll" and len(parts) > 1 and parts[1].lower() == "hips":
             rmd_ids = [int(p) for p in parts[2:]] if len(parts) > 2 else DEFAULT_RMD_IDS
             cmd_poll_hips(ser, rmd_ids)
+        elif cmd == "poll" and len(parts) > 1 and parts[1].lower() == "gim":
+            gim_ids = [int(p) for p in parts[2:]] if len(parts) > 2 else DEFAULT_GIM_IDS
+            cmd_poll_gim(ser, gim_ids)
+        elif cmd == "poll" and len(parts) > 1 and parts[1].lower() == "wheels":
+            nums = [int(p) for p in parts[2:]]
+            if len(nums) >= 2 and len(nums) % 2 == 0:
+                pairs = [(nums[i], nums[i + 1]) for i in range(0, len(nums), 2)]
+            else:
+                if nums:
+                    console.print("[yellow]poll wheels needs pairs (can_id master_id ...) — "
+                                   "using default pairs instead.[/yellow]")
+                pairs = None
+            cmd_poll_wheels(ser, pairs)
         elif cmd == "poll":
             rmd_ids = [int(p) for p in parts[1:]] if len(parts) > 1 else DEFAULT_RMD_IDS
             cmd_poll(ser, rmd_ids, DEFAULT_GIM_IDS)
@@ -973,7 +1260,7 @@ def handle_gim(ser, args):
             console.print(l)
         return
     if len(args) < 2:
-        console.print("[red]Usage: gim <id> <start|stop|pause|torque|velocity|position|fault|ackfault|ind> ...[/red]")
+        console.print("[red]Usage: gim <id> <start|stop|pause|torque|velocity|position|fault|ackfault|ind|masterid> ...[/red]")
         return
     mid, sub = args[0], args[1].lower()
     try:
@@ -998,6 +1285,8 @@ def handle_gim(ser, args):
             send(ser, f"GIM,{mid},ACKFAULT")
         elif sub == "ind":
             send(ser, f"GIM,{mid},IND,{args[2]}")
+        elif sub == "masterid":
+            send(ser, f"GIM,{mid},MASTERID,{args[2]}")
         else:
             console.print(f"[red]Unknown gim subcommand: {sub}[/red]")
             return

@@ -75,16 +75,20 @@ void boardInit(void)
     palSetPad(GPIOE, 4U);
     palSetPadMode(GPIOE, 4U, PAL_MODE_OUTPUT_PUSHPULL | PAL_STM32_OSPEED_HIGHEST);
 
-    /* ── USART2 — TELEM1 (PD5=TX, PD6=RX) → AF7  [CRSF radio] ─────────── */
+    /* ── USART2 — TELEM1 (PD5=TX, PD6=RX) → AF7  [spare / telemetry] ──── */
     palSetPadMode(GPIOD, 5U, PAL_MODE_ALTERNATE(7) | PAL_STM32_OSPEED_HIGHEST);
     palSetPadMode(GPIOD, 6U, PAL_MODE_ALTERNATE(7) | PAL_STM32_PUPDR_PULLUP);
 
-    /* ── USART3 — TELEM2 (PD8=TX, PD9=RX) → AF7  [future sensor] ───────── */
+    /* ── USART3 — TELEM2 (PD8=TX, PD9=RX) → AF7  [SBUS RC input] ───────
+     * Receiver (e.g. RadioLink R9DS) SBUS-out signal wire goes on PD9/RX;
+     * RXINV is set in the USART config (src/coms/SBUS.cpp), not here. */
     palSetPadMode(GPIOD, 8U, PAL_MODE_ALTERNATE(7) | PAL_STM32_OSPEED_HIGHEST);
     palSetPadMode(GPIOD, 9U, PAL_MODE_ALTERNATE(7) | PAL_STM32_PUPDR_PULLUP);
 
-    /* PC7 (SBUSo/USART6) intentionally left unconfigured — SBUS disabled.
-     * RC input is CRSF on TELEM1 (USART2, PD5/PD6). */
+    /* PC7 (USART6_RX) intentionally left unconfigured. On real CubeOrange/
+     * CubeOrange+ hardware this pin is the internal FMU<->IO co-processor
+     * link, not an externally-wired net — no receiver can ever be plugged
+     * into it. See src/coms/SBUS.hpp for the full explanation. */
 
     /* ── USB OTG_FS — micro USB (PA11=DM, PA12=DP) → AF10 ─────────────── */
     palSetPadMode(GPIOA, 11U, PAL_MODE_ALTERNATE(10) | PAL_STM32_OSPEED_HIGHEST);

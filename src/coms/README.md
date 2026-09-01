@@ -103,6 +103,6 @@ Planned use: strain gauge amplifiers.
 
 ## PWM / Radio (`Radio.hpp/.cpp`)
 
-CRSF receiver input. `radio_thr()`, `radio_roll()`, `radio_pitch()`, `radio_yaw()` return normalized RC channel values. `radio_armed()` returns the arm switch state.
+SBUS receiver input (TELEM2 port, USART3). `radio_thr()`, `radio_roll()`, `radio_pitch()`, `radio_yaw()` return normalized RC channel values. `radio_armed()` returns the arm switch state.
 
 `motor_output_write()` selects DShot 600 or standard servo PWM (1000–2000 µs) based on the `MOTOR_PROTOCOL` define in `PWM.hpp`. The MotorMixer and ControlThread always produce 0–1000 normalized commands and are unaffected by this choice.

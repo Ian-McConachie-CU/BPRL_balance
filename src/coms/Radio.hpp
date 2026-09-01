@@ -2,8 +2,10 @@
 #include "hal.h"
 
 /*
- * RC radio input — SBUS on SBUSo port (USART6, PC7 RX, AF8).
- * 100000 baud, 8E2, hardware-inverted on CubeOrangePlus PCB.
+ * RC radio input — SBUS on TELEM2 port (USART3, PD9 RX, AF7).
+ * 100000 baud, 8E2, inverted in the USART itself (CR2 RXINV) since this
+ * port has no hardware inverter — see SBUS.hpp for why USART6/PC7 (the
+ * carrier board's "SBUSo" pin) can't be used instead.
  * 25-byte fixed frame, 16 × 11-bit channels (172–1811, center 992).
  */
 #define RADIO_PROTO_SBUS  0

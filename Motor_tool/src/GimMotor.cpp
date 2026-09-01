@@ -5,6 +5,10 @@
 static GimState s_state[GIM_ID_MAX + 1] = {};   // index 0 unused
 static CanBus   s_bus = CAN_BUS_1;
 
+// Reply arbitration ID per motor id, when different from the motor's own
+// CAN ID (Host/Master CAN ID) — see header comment. 0 = unset = "same as id".
+static uint8_t s_reply_id[GIM_ID_MAX + 1] = {};   // index 0 unused
+
 // Placeholders — see the header comment on gim_set_torque_constant().
 static float s_torque_constant = 1.0f;   // Nm/A, UNKNOWN default
 static float s_gear_ratio      = 1.0f;   // UNKNOWN default
@@ -25,6 +29,18 @@ void  gim_set_torque_limit(float limit_Nm) { s_torque_limit = limit_Nm < 0 ? 0 :
 float gim_get_torque_limit(void)           { return s_torque_limit; }
 
 static bool id_ok(uint8_t id) { return id >= 1 && id <= GIM_ID_MAX; }
+
+void gim_set_reply_id(uint8_t id, uint8_t reply_id)
+{
+    if (!id_ok(id)) return;
+    s_reply_id[id] = reply_id;
+}
+
+uint8_t gim_get_reply_id(uint8_t id)
+{
+    if (!id_ok(id)) return id;
+    return s_reply_id[id] != 0 ? s_reply_id[id] : id;
+}
 
 static float clampf(float x, float lo, float hi)
 {
@@ -156,12 +172,20 @@ static void gim_rx_cb(CanBus bus, const CANRxFrame &f, void *ctx)
     (void)ctx;
     if (bus != s_bus || f.common.XTD || f.DLC < 8) return;
 
-    // Check the full SID before truncating to uint8_t for id_ok() — SID is
-    // 11 bits, and truncating first would alias e.g. 0x10A (266) down to 10
-    // and misattribute an unrelated frame to GIM id 10.
     uint32_t sid = f.std.SID;
-    if (sid < 1U || sid > (uint32_t)GIM_ID_MAX) return;   // response ID == node ID, see header comment
-    uint8_t id = (uint8_t)sid;
+
+    // Reverse-lookup: find which configured GIM id (1..GIM_ID_MAX) expects
+    // its reply on this SID. Defaults to "SID == id itself" for any id
+    // whose reply_id was never overridden (Master CAN ID == CAN ID) — see
+    // the header comment for why that's not always true. Comparing against
+    // the full 32-bit sid (not a truncated copy) avoids e.g. 0x10A (266)
+    // aliasing down to 10 and misattributing an unrelated frame.
+    uint8_t id = 0;
+    for (uint8_t candidate = 1; candidate <= GIM_ID_MAX; candidate++) {
+        uint8_t expected_reply = gim_get_reply_id(candidate);
+        if ((uint32_t)expected_reply == sid) { id = candidate; break; }
+    }
+    if (id == 0) return;   // no configured GIM id expects a reply on this SID
 
     GimState &st = s_state[id];
     uint8_t  cmd = f.data8[0];
@@ -208,5 +232,6 @@ static void gim_rx_cb(CanBus bus, const CANRxFrame &f, void *ctx)
 void gim_init(void)
 {
     memset(s_state, 0, sizeof(s_state));
+    memset(s_reply_id, 0, sizeof(s_reply_id));
     can_subscribe(gim_rx_cb, nullptr);
 }
