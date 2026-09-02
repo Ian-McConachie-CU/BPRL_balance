@@ -32,7 +32,7 @@
  * ever needs re-deriving (new gain structure, different plant assumptions),
  * redo it the same way -- against the model, not by inspection.
  *
- * Steering/yaw is NOT handled by this controller (input[YAW_RATE] is
+ * Steering/yaw is NOT handled by this controller (input[YAW_STICK] is
  * unused) -- it was out of scope for "outer loop = velocity, inner loop =
  * pitch" as specified. Add a differential-wheel-torque term (or its own
  * loop) separately if turning is needed before the LQR controller replaces

@@ -5,7 +5,7 @@
  * CAN bus driver — FDCAN1 (bus 1) and FDCAN2 (bus 2), both at 1 Mbit/s.
  *
  * Bus assignment:
- *   CAN_BUS_1 (FDCAN1) — 6 CAN motors: RMD hip × 4 (IDs 1–4), SDC102 wheel × 2 (IDs 5–6)
+ *   CAN_BUS_1 (FDCAN1) — 6 CAN motors: RMD hip × 4 (IDs 1–4), ODrive wheel × 2 (IDs 5–6)
  *   CAN_BUS_2 (FDCAN2) — Inertial Sense IMX5 INS (std IDs 0x01–0x04)
  *                       + Matek CAN-L4-BM power monitor (DroneCAN BatteryInfo, DTID 1092)
  *
@@ -43,6 +43,16 @@ void bprl_can_register_ext(CanBus bus, uint32_t eid, uint32_t mask,
 
 // Dispatch one received frame to its registered handler (called by CANThread).
 void can_dispatch(CanBus bus, const CANRxFrame &frame);
+
+// Detect a latched bus-off condition (PSR.BO) and clear it by re-triggering
+// the M_CAN bus-off recovery sequence (drops CCCR.INIT; the peripheral then
+// auto-monitors for 128x11 consecutive recessive bits before rejoining, per
+// ISO 11898-1 -- no other register writes needed). ChibiOS's FDCAN LLD never
+// enables/handles the bus-off interrupt itself, so without this a bus-off
+// event (e.g. from a long run of unacked frames) leaves the peripheral
+// silent forever. No-op (one register read) when not in bus-off -- cheap
+// enough to poll every iteration of whichever thread owns this bus's RX.
+void can_check_busoff(CanBus bus);
 
 // Send a frame on the given bus (blocks up to timeout_ms milliseconds).
 bool can_send(CanBus bus, uint32_t sid, const uint8_t *data, uint8_t dlc,

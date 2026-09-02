@@ -16,6 +16,8 @@ pip install pyserial rich
 |---|---|---|
 | `telemetry.py` | `telemetry`, `ekf-status`, `imu-compare` | Required |
 | `motor_test.py` | `motor-test` | No |
+| `radio_test.py` | `rc-status` | No |
+| `targets_test.py` | `tgt-status` | No |
 | `calibrate.py` | `calibrate` | Required |
 | `can_tools.py` | `can-status`, `can-scan` | No |
 | `logs.py` | `logs list/download/decode/erase`, `log-status` | No |
@@ -64,6 +66,56 @@ python3 tools/motor_test.py motor-test
 | `quit` | Exit |
 
 Motor IDs: 1–4 = hip joints (LKMTECH MG8016E-i6, RMD protocol), 5–6 = wheels (Steadywin GIM6010-6, SDC102).
+
+---
+
+## radio_test.py
+
+> Works on any firmware build.
+
+Live dump of all 16 raw SBUS channels received on TELEM2 (USART3), via the
+`RC,status` USB command — polls the firmware at `--rate` Hz (default 20).
+Shows each channel's raw 11-bit value (172–1811, center 992) with a bar
+gauge, the receiver's `frame_lost`/`failsafe` flags, and the decoded armed
+state. Channels 0–9 are labeled per this robot's channel map (see the main
+`README.md` for the full table and firmware wiring); 10–15 show raw values
+only.
+
+```bash
+python3 tools/radio_test.py rc-status
+python3 tools/radio_test.py rc-status --rate 30
+```
+
+Use this to confirm a transmitter/receiver pair is bound and wired correctly
+before trusting stick/switch input in the balance controller: move each
+stick/switch and confirm the corresponding channel tracks it, and check that
+`frame_lost`/`failsafe` stay clear with the transmitter on.
+
+---
+
+## targets_test.py
+
+> Works on any firmware build.
+
+Live view of the **processed** system targets — `g_input[]`, `g_armed`, and
+`RobotStateMachine::mode()` — via the `TGT,status` USB command, polling at
+`--rate` Hz (default 20). Unlike `radio_test.py` (which shows raw SBUS
+channel values straight off the wire), this shows what the control pipeline
+actually sees after `Radio.cpp`'s normalization/inversion, so it exercises
+the full radio-input plumbing end to end: SBUS → `Radio.cpp` accessors →
+`g_input[]`/`g_armed` → `RobotStateMachine`.
+
+```bash
+python3 tools/targets_test.py tgt-status
+```
+
+Shows: armed state, the mode-select switch's raw value alongside the
+resulting state-machine mode name, and bar gauges for velocity/yaw/height/
+lean targets. `height_tgt`/`lean_tgt` are read but not yet consumed by any
+controller, and `CAR` mode is reachable (mode switch low + armed) but
+**stubbed** — zero torque, same as `IDLE` — until wheel mixing and the
+car/balance transitions are implemented (see the main `README.md`'s planned
+state machine section).
 
 ---
 

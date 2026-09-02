@@ -9,7 +9,7 @@
  *   RadioThread    +10  100 Hz   SBUS → g_input[] / g_armed
  *   HeartbeatThread -5  5 Hz     LED blink
  *   DebugThread    -10  10 Hz    USB $TEL/$EKFL stream (BPRL_DEBUG only)
- *   USBCmdThread   -20  event    USB command parser (LOG, CAL, CAN, MOTOR, POWER)
+ *   USBCmdThread   -20  event    USB command parser (LOG, CAL, CAN, MOTOR, POWER, RC, TGT)
  *   LogThread      -15  50 Hz    Binary SD card logging
  */
 
@@ -20,6 +20,7 @@
 #include "src/coms/CANMotor.hpp"
 #include "src/coms/CANPower.hpp"
 #include "src/coms/Radio.hpp"
+#include "src/coms/SBUS.hpp"
 #include "src/controllers/RobotStateMachine.hpp"
 #include "src/controllers/ActuatorSafety.hpp"
 #include "src/state_estimator/StateManager.hpp"
@@ -161,9 +162,11 @@ static THD_FUNCTION(CANThread, arg)
         // Bus 1 (motors, IMX5, strain sensor)
         if (canReceiveTimeout(&CAND1, CAN_ANY_MAILBOX, &rxf, TIME_US2I(500)) == MSG_OK)
             can_dispatch(CAN_BUS_1, rxf);
+        can_check_busoff(CAN_BUS_1);
         // Bus 2 (external IMU, current sensor)
         if (canReceiveTimeout(&CAND2, CAN_ANY_MAILBOX, &rxf, TIME_US2I(500)) == MSG_OK)
             can_dispatch(CAN_BUS_2, rxf);
+        can_check_busoff(CAN_BUS_2);
     }
 }
 
@@ -289,19 +292,35 @@ static THD_FUNCTION(RadioThread, arg)
     chRegSetThreadName("radio");
     const sysinterval_t period = *static_cast<const sysinterval_t *>(arg);
 
+    // Height-set hold-to-zero-on-arm: while disarmed, held true so height
+    // target is forced to zero regardless of where the stick physically
+    // sits. On arming, stays true (so height still reads zero) until the
+    // stick is brought back through the deadband's zero zone at least once
+    // -- avoids a sudden jump to whatever the stick happens to be at when
+    // arming. Resets to true every cycle while disarmed, so each new arm
+    // cycle requires the stick to be zeroed again.
+    bool height_hold_active = true;
+
     systime_t next = chVTGetSystemTime();
     while (true) {
         radio_input_update();
 
+        const float height_raw = radio_height_set();
+        const bool  armed_now  = radio_armed();
+        if (!armed_now) {
+            height_hold_active = true;
+        } else if (height_hold_active && height_raw == 0.0f) {
+            height_hold_active = false;
+        }
+        const float height_tgt = height_hold_active ? 0.0f : height_raw;
+
         chMtxLock(&state_mtx);
-        g_input[InputIdx::THRUST]      = radio_thr();
-        g_input[InputIdx::ROLL_TGT]    = radio_roll();
-        g_input[InputIdx::PITCH_TGT]   = radio_pitch();
-        g_input[InputIdx::YAW_RATE]    = radio_yaw();
-        g_input[InputIdx::MODE_SW]     = radio_mode_sw();
+        g_input[InputIdx::YAW_STICK]   = radio_yaw_stick();
         g_input[InputIdx::VEL_TGT]     = radio_vel_tgt();
-        g_input[InputIdx::CTRL_SEL]    = radio_ctrl_sel();
-        g_armed = radio_armed();
+        g_input[InputIdx::HEIGHT_SET]  = height_tgt;
+        g_input[InputIdx::LEANOVER]    = radio_leanover();
+        g_input[InputIdx::MODE_SW]     = radio_mode_sw();
+        g_armed = armed_now;
         chMtxUnlock(&state_mtx);
 
         next = chThdSleepUntilWindowed(next, chTimeAddX(next, period));
@@ -328,7 +347,8 @@ static THD_FUNCTION(HeartbeatThread, arg)
 
 /* ══════════════════════════════════════════════════════════════════════════
  * USBCmdThread — event-driven  NORMALPRIO-20
- * Commands: BOOT, LOG,*, CAL,*, CAN,*, STRAIN_RATE,read
+ * Commands: BOOT, LOG,*, CAL,*, CAN,*, STRAIN_RATE,read, MOTOR,status,
+ *           POWER,status, RC,status, TGT,status
  * ══════════════════════════════════════════════════════════════════════════ */
 
 static void usb_log_list(void)
@@ -589,6 +609,43 @@ static void usb_cmd_dispatch(const char *line)
                  (int)pwr.valid, (unsigned)pwr.node_id,
                  (double)pwr.voltage_V, (double)pwr.current_A);
         chMtxUnlock(&s_usb_write_mtx);
+    } else if (strcmp(line, "RC,status") == 0) {
+        chMtxLock(&state_mtx);
+        bool armed = g_armed;
+        chMtxUnlock(&state_mtx);
+        chMtxLock(&s_usb_write_mtx);
+        chprintf((BaseSequentialStream *)&SDU1,
+                 "RC,STATUS,frame_lost=%d,failsafe=%d,armed=%d",
+                 (int)g_sbus.frame_lost(), (int)g_sbus.failsafe(), (int)armed);
+        for (int ch = 0; ch < 16; ch++) {
+            chprintf((BaseSequentialStream *)&SDU1, ",ch%d=%u",
+                     ch, (unsigned)g_sbus.channel(ch));
+        }
+        chprintf((BaseSequentialStream *)&SDU1, "\r\n");
+        chMtxUnlock(&s_usb_write_mtx);
+    } else if (strcmp(line, "TGT,status") == 0) {
+        float yaw_tgt, vel_tgt, height_tgt, lean_tgt, mode_sw;
+        bool  armed;
+        chMtxLock(&state_mtx);
+        yaw_tgt    = g_input[InputIdx::YAW_STICK];
+        vel_tgt    = g_input[InputIdx::VEL_TGT];
+        height_tgt = g_input[InputIdx::HEIGHT_SET];
+        lean_tgt   = g_input[InputIdx::LEANOVER];
+        mode_sw    = g_input[InputIdx::MODE_SW];
+        armed      = g_armed;
+        chMtxUnlock(&state_mtx);
+
+        RobotMode   mode = robot_sm.mode();
+        const char *mode_name = (mode == ROBOT_IDLE)      ? "IDLE"
+                               : (mode == ROBOT_BALANCING) ? "BALANCING"
+                                                            : "CAR";
+        chMtxLock(&s_usb_write_mtx);
+        chprintf((BaseSequentialStream *)&SDU1,
+                 "TGT,STATUS,armed=%d,mode_sw=%.3f,mode=%d,mode_name=%s,"
+                 "vel_tgt=%.3f,yaw_tgt=%.3f,height_tgt=%.3f,lean_tgt=%.3f\r\n",
+                 (int)armed, (double)mode_sw, (int)mode, mode_name,
+                 (double)vel_tgt, (double)yaw_tgt, (double)height_tgt, (double)lean_tgt);
+        chMtxUnlock(&s_usb_write_mtx);
     }
 }
 
@@ -643,7 +700,7 @@ static THD_FUNCTION(DebugThread, arg)
             rate_tick     = 0;
         }
 
-        float roll, pitch, yaw, thr, rc_roll, rc_pitch, rc_yaw;
+        float roll, pitch, yaw, vel_tgt, height_set, leanover, yaw_stick;
         float p, q, r;
         float lane_roll[3], lane_pitch[3], lane_yaw[3];
         float lane_p[3],    lane_q[3],    lane_r[3];
@@ -656,11 +713,11 @@ static THD_FUNCTION(DebugThread, arg)
         p        = g_state[StateIdx::P];
         q        = g_state[StateIdx::Q];
         r        = g_state[StateIdx::R];
-        thr      = g_input[InputIdx::THRUST];
-        rc_roll  = g_input[InputIdx::ROLL_TGT];
-        rc_pitch = g_input[InputIdx::PITCH_TGT];
-        rc_yaw   = g_input[InputIdx::YAW_RATE];
-        armed    = g_armed;
+        vel_tgt    = g_input[InputIdx::VEL_TGT];
+        height_set = g_input[InputIdx::HEIGHT_SET];
+        leanover   = g_input[InputIdx::LEANOVER];
+        yaw_stick  = g_input[InputIdx::YAW_STICK];
+        armed      = g_armed;
         for (int li = 0; li < 3; ++li) {
             lane_roll[li]  = s_lane_roll[li];
             lane_pitch[li] = s_lane_pitch[li];
@@ -715,7 +772,7 @@ static THD_FUNCTION(DebugThread, arg)
                 (uint32_t)TIME_I2MS(chVTGetSystemTime()),
                 (double)(roll*57.2958f), (double)(pitch*57.2958f), (double)(yaw*57.2958f),
                 (double)p, (double)q, (double)r,
-                (double)thr, (double)rc_roll, (double)rc_pitch, (double)rc_yaw,
+                (double)vel_tgt, (double)height_set, (double)leanover, (double)yaw_stick,
                 (int)armed,
                 (int)imu_v[0], (int)imu_v[1], (int)imu_v[2], (int)can_v,
                 can_quat_hz, can_rate_hz);
@@ -822,10 +879,10 @@ static THD_FUNCTION(LogThread, arg)
         {
             LogMsgRCIN msg = {};
             msg.time_us   = t_us; msg.rate_hz = 50U;
-            msg.roll_stk  = inp[InputIdx::ROLL_TGT];
-            msg.pitch_stk = inp[InputIdx::PITCH_TGT];
-            msg.yaw_stk   = inp[InputIdx::YAW_RATE];
-            msg.thr_stk   = inp[InputIdx::THRUST];
+            msg.yaw_stk    = inp[InputIdx::YAW_STICK];
+            msg.vel_stk    = inp[InputIdx::VEL_TGT];
+            msg.height_stk = inp[InputIdx::HEIGHT_SET];
+            msg.lean_stk   = inp[InputIdx::LEANOVER];
             msg.armed     = (uint8_t)armed;
             logger.write(LOG_MSG_RCIN, msg);
         }

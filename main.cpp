@@ -9,7 +9,7 @@
  *   src/threads.cpp/.hpp         Thread bodies + shared state.
  *   src/coms/SPI.*               ICM-20948/20602 onboard IMU drivers.
  *   src/coms/CAN.*               FDCAN1 + FDCAN2 drivers, device registration.
- *   src/coms/CANMotor.*          6-motor CAN abstraction (RMD + SDC102).
+ *   src/coms/CANMotor.*          6-motor CAN abstraction (RMD + ODrive).
  *   src/coms/Radio.*             SBUS radio input (USART3, TELEM2 port).
  *   src/controllers/             RobotStateMachine, BalanceController, PID.
  *   src/state_estimator/         3-lane EKF.
@@ -23,8 +23,13 @@
  *   ID 2  Hip FR   — LKMTECH MG8016E-i6
  *   ID 3  Hip RL   — LKMTECH MG8016E-i6
  *   ID 4  Hip RR   — LKMTECH MG8016E-i6
- *   ID 5  Wheel L  — Steadywin GIM6010-6 (SDC102 protocol)
- *   ID 6  Wheel R  — Steadywin GIM6010-6
+ *   ID 5  Wheel L  — Steadywin GIM6010-8 on GDS68, ODrive fw, node_id 2
+ *   ID 6  Wheel R  — Steadywin GIM6010-8 on GDS68, ODrive fw, node_id 3
+ *
+ * Wheel node_ids (2/3) are these drives' own existing ODrive config, kept
+ * as-is rather than reconfigured — deliberately different from their slot
+ * ids (5/6) here since 2/3 are already taken by hip FR/RL. See
+ * can_motor_register()'s node_id param in src/coms/CANMotor.hpp.
  */
 
 #include "ch.h"
@@ -97,8 +102,12 @@ int main(void)
     can_motor_register(2, CAN_MOTOR_RMD);     // hip FR
     can_motor_register(3, CAN_MOTOR_RMD);     // hip RL
     can_motor_register(4, CAN_MOTOR_RMD);     // hip RR
-    can_motor_register(5, CAN_MOTOR_SDC102);  // wheel L
-    can_motor_register(6, CAN_MOTOR_SDC102);  // wheel R
+    // node_id 2/3 matches these drives' existing ODrive config (unchanged
+    // from final-project-Ian-McConachie-CU) — slot 5/6 is this project's own
+    // numbering, kept apart from node_id specifically so it doesn't collide
+    // with hip FR/RL's slot ids 2/3 above (see CANMotor.hpp's can_motor_register()).
+    can_motor_register(5, CAN_MOTOR_ODRIVE, /*node_id=*/2);  // wheel L
+    can_motor_register(6, CAN_MOTOR_ODRIVE, /*node_id=*/3);  // wheel R
 
     radio_input_init();   // SBUS on USART3 (TELEM2 port, 100000 baud 8E2, RXINV)
 

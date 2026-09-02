@@ -8,8 +8,10 @@ MATLAB model and the firmware, and the order to build it in.
 **Status:** §6 (`BalanceController` + two sub-controllers) and the wheel-
 encoder half of the EKF fusion are implemented — `PidBalanceController`
 (SLC PID cascade, hips locked via `HipLock`) and `LqrBalanceController`
-(stub, `K` all-zero) are both wired up and selectable at runtime via
-`input[InputIdx::CTRL_SEL]`, and `StateManager`/`EKF` now fuse wheel-encoder
+(stub, `K` all-zero) are both wired up and selectable via the
+`BALANCE_CONTROLLER` compile-time flag in `BalanceController.hpp` (no
+runtime RC channel — every transmitter channel is spoken for, see the
+channel map in `README.md`), and `StateManager`/`EKF` now fuse wheel-encoder
 velocity as described in §1's `xdot ≈ U` note. `FiveBarIK` (§3), the
 leg-angle `StateIdx` extension (§2/§4), and the real LQR gain table (§5)
 are still pending — `LqrBalanceController` reads `theta`/`thetadot` as a
@@ -225,7 +227,7 @@ Replace the stub body (`src/controllers/BalanceController.cpp`) with, per
    (`p.tau_wheel_peak`, `p.tau_hip_cont` equivalents) → `[T, Tp]`.
 4. **Wheel torque `T`** → CAN ids 5/6 (`can_motor_set_torque`), split evenly
    between the two wheels plus a differential term from
-   `input[InputIdx::YAW_RATE]` for turning (yaw control isn't in the
+   `input[InputIdx::YAW_STICK]` for turning (yaw control isn't in the
    sagittal model at all — this is a separate, simple loop layered on top).
 5. **Hip torque `Tp`** → split per leg via the VMC mapping
    (`jointTorques`/`jac` from §3), evaluated at each leg's *own* current
@@ -265,7 +267,7 @@ Before ever letting this balance:
   current tuning has, before it meets the real, noisier StateManager output.
   `plot_response.m` demonstrates this live, plus tracking a commanded
   forward velocity rather than just regulating to standstill — useful as a
-  template for exercising `input[InputIdx::THRUST]`-style velocity commands
+  template for exercising `input[InputIdx::VEL_TGT]`-style velocity commands
   once `BalanceController` is real.
 
 ---

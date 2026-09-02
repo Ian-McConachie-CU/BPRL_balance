@@ -103,6 +103,8 @@ Planned use: strain gauge amplifiers.
 
 ## PWM / Radio (`Radio.hpp/.cpp`)
 
-SBUS receiver input (TELEM2 port, USART3). `radio_thr()`, `radio_roll()`, `radio_pitch()`, `radio_yaw()` return normalized RC channel values. `radio_armed()` returns the arm switch state.
+SBUS receiver input (TELEM2 port, USART3). `radio_yaw_stick()`, `radio_vel_tgt()`, `radio_height_set()`, `radio_leanover()`, `radio_mode_sw()` return normalized RC channel values per this robot's channel map (see main `README.md`, section 2); `radio_armed()` returns the arm switch state.
 
 `motor_output_write()` selects DShot 600 or standard servo PWM (1000–2000 µs) based on the `MOTOR_PROTOCOL` define in `PWM.hpp`. The MotorMixer and ControlThread always produce 0–1000 normalized commands and are unaffected by this choice.
+
+Raw channel values (all 16, plus `frame_lost`/`failsafe`/armed) are readable live from a host PC via the `RC,status` USB command (`USBCmdThread` in `threads.cpp`) — see `tools/radio_test.py`.

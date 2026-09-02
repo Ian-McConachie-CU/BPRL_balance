@@ -118,22 +118,22 @@ function p = params()
 %        measured / CAD values before trusting any gain it produces.
 
 % --- masses and inertias, WHOLE ROBOT (both sides lumped into one sagittal model)
-p.m_w = 1.6;        % both wheels + rotating parts                    [kg]
-p.I_w = 0.0039;     % both wheels about the axle, ~ m_w*R^2/2         [kg m^2]
-p.m_l = 1.4;        % both legs (linkage) total                       [kg]
-p.I_l = 0.011;      % legs about their own COM                        [kg m^2]
-p.m_b = 15.0;        % body + electronics + payload                    [kg]
-p.I_b = 0.055;      % body about its COM, pitch axis                  [kg m^2]
+p.m_w = .8;        % both wheels + rotating parts                    [kg]
+p.I_w = 0.004;     % both wheels about the axle, ~ m_w*R^2/2         [kg m^2]
+p.m_l = 0.53;        % both legs (linkage) total                       [kg]
+p.I_l = 0.002;      % legs about their own COM                        [kg m^2]
+p.m_b = 9.90;        % body + electronics + payload                    [kg]
+p.I_b = 0.08;      % body about its COM, pitch axis                  [kg m^2]
 
-p.R   = 0.09;      % wheel radius                                    [m]
+p.R   = 0.092;      % wheel radius                                    [m]
 p.l_c = 0.5;        % leg COM distance from WHEEL AXLE, FRACTION of L [-]
 p.l_b = 0.060;      % body COM distance from hip, along +body axis    [m]
 
 % --- 5-bar geometry (see ik/fk for the labelling)
-p.l1 = 0.150;       % rear thigh   A->B
-p.l2 = 0.270;       % rear shin    B->C
-p.l3 = 0.270;       % front shin   C->D
-p.l4 = 0.150;       % front thigh  E->D
+p.l1 = 0.130;       % rear thigh   A->B
+p.l2 = 0.220;       % rear shin    B->C
+p.l3 = 0.220;       % front shin   C->D
+p.l4 = 0.130;       % front thigh  E->D
 p.l5 = 0.100;       % hip spacing  A->E
 
 % --- actuator limits (datasheet)

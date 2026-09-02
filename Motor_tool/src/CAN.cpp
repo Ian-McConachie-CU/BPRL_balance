@@ -5,13 +5,22 @@
  * FDCAN1/2 bit timing — 1 Mbit/s, PLL2Q = 80 MHz.
  * BRP=5, TSEG1=13, TSEG2=2 -> 16 Tq/bit, 87.5% sample point.
  * Identical to BPRL_balance's src/coms/CAN.cpp — same MCU, same clock tree.
+ *
+ * CCCR_DAR (Disable Automatic Retransmission): without this, an unacked
+ * frame (e.g. probing a CAN ID with nothing listening) gets retried by the
+ * FDCAN hardware immediately and indefinitely instead of just failing once —
+ * discovered 2026-09-01 bringing up the wheel motors, where a single
+ * `poll wheels`/`poll gim` against an unacked ID monopolized the bus and
+ * ran TEC up to bus-off. This tool's commands are one-shot requests, not a
+ * periodically-reissued control loop, so there's no self-healing reason to
+ * let the hardware retry-storm a stale one.
  */
 static const CANConfig can_cfg = {
-    0x00040C01,   // NBTP
-    0x00000000,   // DBTP
-    0x00000000,   // CCCR
-    0x00000000,   // TEST
-    0x00000000,   // RXGFC: accept all in RxFIFO0
+    0x00040C01,           // NBTP
+    0x00000000,           // DBTP
+    FDCAN_CCCR_DAR,        // CCCR
+    0x00000000,           // TEST
+    0x00000000,           // RXGFC: accept all in RxFIFO0
 };
 
 /* Internal loopback + bus-monitoring config for can_selftest() — same bit
@@ -252,6 +261,24 @@ bool can_selftest(CanBus bus, CanSelftestResult *detail)
     return rx_matched;
 }
 
+/* ── Bus-off detection/recovery ─────────────────────────────────────────
+ * ChibiOS's FDCAN LLD never enables/handles the bus-off interrupt (IR_BO) —
+ * see hal_can_lld.c's can_lld_serve_interrupt(), which only wires up
+ * RF0N/RF1N/RF0L/RF1L/TC. Once TEC latches past 255 (bus-off), the M_CAN
+ * core auto-sets CCCR.INIT and goes silent forever unless something clears
+ * INIT again to restart the standard ISO 11898-1 recovery sequence (128 x
+ * 11 consecutive recessive bits, monitored entirely in hardware from there —
+ * no other register writes needed). Polled cheaply (one register read when
+ * healthy) from CANRxThread below rather than adding a new ISR.
+ */
+static void can_check_busoff(CanBus bus)
+{
+    CANDriver *drv = (bus == CAN_BUS_1) ? &CAND1 : &CAND2;
+    if ((drv->fdcan->PSR & FDCAN_PSR_BO) != 0U) {
+        drv->fdcan->CCCR &= ~FDCAN_CCCR_INIT;
+    }
+}
+
 /* ── RX thread ───────────────────────────────────────────────────────────── */
 
 static THD_WORKING_AREA(waCANRx, 2048);
@@ -266,9 +293,11 @@ static THD_FUNCTION(CANRxThread, arg)
         // reconfiguring/reading itself — see the comment by s_selftest_active.
         if (!(s_selftest_active && s_selftest_bus == CAN_BUS_1)) {
             if (poll_fifo0(&CAND1, rxf)) { can_dispatch(CAN_BUS_1, rxf); any = true; }
+            can_check_busoff(CAN_BUS_1);
         }
         if (!(s_selftest_active && s_selftest_bus == CAN_BUS_2)) {
             if (poll_fifo0(&CAND2, rxf)) { can_dispatch(CAN_BUS_2, rxf); any = true; }
+            can_check_busoff(CAN_BUS_2);
         }
         // Pure polling now (see poll_fifo0 comment) — yield briefly when
         // idle so this doesn't spin at 100%; drain back-to-back without

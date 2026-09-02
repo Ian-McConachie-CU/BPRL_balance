@@ -720,6 +720,96 @@ def cmd_poll_wheels(ser, pairs=None):
                        + ", ".join(f"0x{cid:03x} x{n}" for cid, n in other_bus1_ids.items()) + "[/dim]")
 
 
+def cmd_find_gim(ser, id_lo=1, id_hi=32, per_id_timeout=0.25):
+    """Blind-scan CAN IDs [id_lo, id_hi] for a SteadyWin GIM wheel motor by
+    sending a one-shot 0xB2 (Get Fault) request to each candidate ID in turn
+    and watching ALL bus-1 traffic for a distinct reply — doesn't assume the
+    reply lands on the same ID as the command, since GIM's reply address is
+    a separately-configured Master CAN ID that's confirmed to differ on
+    this project's wheels (see CAN_config.md / poll_wheels). This is the
+    tool to use when you don't already know a wheel's CAN ID (or its reply
+    ID) and want to find both empirically.
+
+    Safe to run broadly now that CCCR_DAR is enabled in firmware
+    (2026-09-01): a probe against an ID with nothing listening just fails
+    once instead of retry-storming the bus toward bus-off, which is what
+    made a blind full-range scan like this dangerous before that fix.
+
+    On a hit, learns the CAN-ID -> reply-ID mapping (adds it to
+    DEFAULT_GIM_MASTER_IDS for the rest of this session) and runs a full
+    poll_gim on it to confirm the connection end-to-end — decoded
+    fault/indicator values, not just "a frame came back".
+    """
+    n = id_hi - id_lo + 1
+    console.print(f"[bold]find gim[/bold] — probing CAN IDs {id_lo}-{id_hi} on bus 1 "
+                  f"({per_id_timeout * 1000:.0f} ms/id, ~{n * per_id_timeout:.0f}s total)\n")
+
+    send(ser, "CAN,monitor,start")
+    read_lines_until(ser, None, timeout=0.3)
+
+    # Bucket captured lines per probed id (not one flat list) so a slightly
+    # late reply can't get attributed to the wrong probe.
+    per_probe = []
+    for gid in range(id_lo, id_hi + 1):
+        send(ser, f"GIM,{gid},FAULT")
+        lines = read_lines_until(ser, None, timeout=per_id_timeout)
+        per_probe.append((gid, lines))
+
+    send(ser, "CAN,monitor,stop")
+    read_lines_until(ser, None, timeout=0.3)
+
+    hits = []
+    for gid, lines in per_probe:
+        frames = []
+        for line in lines:
+            if not line.startswith("MON,"):
+                continue
+            parts = line[4:].split(",")
+            if len(parts) < 5:
+                continue
+            t_ms, bus, cid_str, _is_ext, dlc = parts[:5]
+            if bus != "1":
+                continue
+            try:
+                cid = int(cid_str, 16)
+                data = [int(x, 16) for x in parts[5:5 + int(dlc)]]
+            except ValueError:
+                continue
+            frames.append((cid, int(t_ms), data))
+        # Our own echoed request always shows up on SID==gid with an
+        # all-zero payload after the command byte (see poll_gim/poll_wheels)
+        # — filter that out; anything else is a real reply, on any SID.
+        replies = [(cid, t_ms, data) for cid, t_ms, data in frames
+                   if not (cid == gid and len(data) == 8 and all(b == 0 for b in data[1:]))]
+        if replies:
+            hits.append((gid, replies[0][0], replies))
+
+    if not hits:
+        console.print(f"[yellow]No GIM replies seen for any ID {id_lo}-{id_hi}. Check "
+                       f"power/wiring/termination, or that the drive's CAN ID is actually "
+                       f"inside this range.[/yellow]")
+        return []
+
+    console.print(f"[bold green]Found {len(hits)} candidate GIM ID(s):[/bold green]")
+    for gid, reply_id, replies in hits:
+        tag = "" if reply_id == gid else \
+            f"  [yellow](reply on different SID {reply_id} != CAN ID {gid})[/yellow]"
+        console.print(f"  CAN ID {gid} -> reply SID {reply_id}{tag}")
+        for cid, t_ms, data in replies:
+            hexs = " ".join(f"{b:02x}" for b in data)
+            console.print(f"    t={t_ms:>8}ms  SID=0x{cid:03x}  bytes=<{hexs}>")
+
+    console.print(f"\n[bold]Establishing connection...[/bold]")
+    for gid, reply_id, _ in hits:
+        if reply_id != gid:
+            DEFAULT_GIM_MASTER_IDS[gid] = reply_id
+            console.print(f"  Learned GIM {gid}: reply id -> {reply_id} "
+                           f"(added to known mapping for this session)")
+        cmd_poll_gim(ser, [gid])
+
+    return hits
+
+
 _RMD_STATUS_RE = re.compile(
     r"STATUS,RMD,(\d+),pos=([-\d.]+),vel=([-\d.]+),tq=([-\d.]+),"
     r"temp=([-\d.]+),volt=([-\d.]+),err=0x([0-9a-fA-F]+),age_ms=(\d+)")
@@ -1091,6 +1181,7 @@ def print_help():
   poll hips [rmd_id ...]                  poll RMD hips with CAN monitor running; show raw bytes + independent decode per ID
   poll gim [gim_id ...]                   poll GIM wheels with CAN monitor running; show raw bytes + independent decode per ID
   poll wheels [can_id master_id ...]      check BOTH CAN ID and Master CAN ID per wheel for replies (default: 15/16, 20/21)
+  find gim [id_lo] [id_hi]                blind-scan CAN IDs id_lo-id_hi (default 1-32) for a GIM wheel motor; on a hit, learns its reply ID and confirms the connection (poll gim). Safe now that DAR is enabled — a dead ID just fails once instead of retry-storming the bus.
   test hips [rmd_id ...]                  MOVES hips (one at a time) to 0deg then 120deg; confirms before moving anything
   test drift [rmd_id ...]                 no motion — samples encoder for 5s, reports if it moves while nominally still
   scan [seconds]                          ID scanner on the active bus
@@ -1164,6 +1255,10 @@ def repl(ser):
                                    "using default pairs instead.[/yellow]")
                 pairs = None
             cmd_poll_wheels(ser, pairs)
+        elif cmd == "find" and len(parts) > 1 and parts[1].lower() == "gim":
+            id_lo = int(parts[2]) if len(parts) > 2 else 1
+            id_hi = int(parts[3]) if len(parts) > 3 else 32
+            cmd_find_gim(ser, id_lo, id_hi)
         elif cmd == "poll":
             rmd_ids = [int(p) for p in parts[1:]] if len(parts) > 1 else DEFAULT_RMD_IDS
             cmd_poll(ser, rmd_ids, DEFAULT_GIM_IDS)

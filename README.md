@@ -15,11 +15,11 @@ Forked from BPRL_flight; drone-specific code removed and replaced with dual-bus 
 - Fill in `LqrBalanceController::K` with real gains from
   `MatLab_controls/wheeled_biped.m` once `params()` reflects measured
   hardware (currently all-zero stub).
-- Wire up the physical RC switches for `InputIdx::VEL_TGT` / `CTRL_SEL`
-  (placeholder SBUS channels 6/7 for now — see `Radio.cpp`).
 - Add leg joint angle / rate states to `StateIdx` + `FiveBarIK` module (see
   `controls_plan.md`) — needed before the LQR controller can use real
-  theta/thetadot instead of its current 0 placeholder.
+  theta/thetadot instead of its current 0 placeholder, and before
+  `InputIdx::HEIGHT_SET` / `LEANOVER` (already wired, see section 2 below)
+  or the planned CAR mode / stand-up-crouch transitions can be implemented.
 - Register IMU and current sensor callbacks on FDCAN2 (CAN bus 2).
 - Implement SDC102 CAN protocol for Steadywin GIM6010-6 wheel motors.
 - Add firmware-side USB command handlers for `MOTOR,torque` and `MOTOR,velocity`.
@@ -128,6 +128,41 @@ BPRL_balance/
 
 RMD command frame: SID `0x140 + id`, response SID `0x240 + id`, 8 bytes, command byte `0xA1` = torque.
 
+### RC channel map (SBUS, TELEM2)
+
+This robot's transmitter channel layout — **not** the usual drone
+throttle/roll/pitch/yaw mapping. See `src/coms/Radio.hpp` for the driver
+and `tools/radio_test.py` for a live channel dashboard.
+
+| Ch | Assignment | Wired to |
+|---|---|---|
+| 0 | Yaw stick | `InputIdx::YAW_STICK` |
+| 1 | Forward velocity target | `InputIdx::VEL_TGT` |
+| 2 | Height-set switch | `InputIdx::HEIGHT_SET` — placeholder, no controller consumes it yet; held at 0 on arm until first brought to zero (see below) |
+| 3 | Leanover switch | `InputIdx::LEANOVER` — placeholder, no controller consumes it yet |
+| 4 | Arm switch (AuxF) | `g_armed` |
+| 5 | AuxA | *(reserved, not wired to anything yet)* |
+| 6 | Mode select switch (AuxB, two-position) | `InputIdx::MODE_SW` — car/balance select |
+| 7 | AuxH | *(reserved, not wired to anything yet)* |
+| 8 | AuxD | *(reserved, not wired to anything yet)* |
+| 9 | AuxC | *(reserved, not wired to anything yet)* |
+| 10–15 | — | unused |
+
+Controller select (PID cascade vs. LQR) is **not** an RC channel — it's the
+`BALANCE_CONTROLLER` compile-time flag in `BalanceController.hpp`, since
+LQR is still a zero-gain stub and every transmitter channel above is
+already spoken for.
+
+All `[-1,1]` channels have a small deadband around center (`STICK_DEADBAND`
+in `Radio.cpp`) so noise at rest doesn't produce a nonzero command.
+
+**Height-set arm safety:** `HEIGHT_SET` is forced to 0 whenever disarmed,
+and stays forced to 0 after arming until the stick is physically brought
+back through center at least once — this prevents a jump to wherever the
+stick happens to be sitting at the moment of arming. Disarming resets this,
+so every new arm cycle requires zeroing the stick again. See `RadioThread`
+in `threads.cpp`.
+
 ---
 
 ## 3. State Estimation (EKF)
@@ -155,20 +190,31 @@ Future: joint angles and joint rates will be appended beyond index 18 once leg k
 
 | Mode | Trigger | Action |
 |---|---|---|
-| `ROBOT_IDLE` | Disarmed or `MODE_SW < 0` | Zero torque on all motors |
+| `ROBOT_IDLE` | Disarmed | Zero torque on all motors |
+| `ROBOT_CAR` | Armed and `MODE_SW < 0` | **Stubbed** — zero torque, same as IDLE, but reported as a distinct mode; see planned mode state machine below |
 | `ROBOT_BALANCING` | Armed and `MODE_SW ≥ 0` | Calls BalanceController |
-| `ROBOT_MANUAL` | Reserved | Not yet implemented |
 
 ### BalanceController
 
-Dispatches between two balance controllers based on `input[InputIdx::CTRL_SEL]`, so both can be bench-tested without reflashing:
+Dispatches between two balance controllers via the `BALANCE_CONTROLLER` **compile-time** flag (`BalanceController.hpp`), so both can still be bench-tested/A-B compared, just by reflashing rather than an RC switch — no transmitter channel is spare for this (see the channel map in section 2):
 
 | Controller | Selected when | Description |
 |---|---|---|
-| `PidBalanceController` | `CTRL_SEL < 0` | Stage 0: single-loop-cascade (SLC) PID — outer loop on forward velocity produces a pitch setpoint, inner loop on pitch produces wheel torque. Hips held at a fixed angle by `HipLock`. |
-| `LqrBalanceController` | `CTRL_SEL ≥ 0` | Stage 1: gain-scheduled LQR state feedback using gains from `wheeled_biped.m`. **Stubbed** — `K` is all-zero pending real gains once `params()` is measured. |
+| `PidBalanceController` | `BALANCE_CONTROLLER == BALANCE_CTRL_PID` (default) | Stage 0: single-loop-cascade (SLC) PID — outer loop on forward velocity produces a pitch setpoint, inner loop on pitch produces wheel torque. Hips held at a fixed angle by `HipLock`. |
+| `LqrBalanceController` | `BALANCE_CONTROLLER == BALANCE_CTRL_LQR` | Stage 1: gain-scheduled LQR state feedback using gains from `wheeled_biped.m`. **Stubbed** — `K` is all-zero pending real gains once `params()` is measured. |
 
-Both read velocity target from `input[InputIdx::VEL_TGT]` and hold the hips via the shared `HipLock` helper (four independent per-motor position PIDs — see that class's header for why this doesn't need whole-body state to work correctly). Neither controller does steering/yaw mixing yet. `VEL_TGT`/`CTRL_SEL` read placeholder SBUS channels (6/7) until the physical RC switches are assigned — see `Radio.cpp`.
+Both read velocity target from `input[InputIdx::VEL_TGT]` (ch1) and hold the hips via the shared `HipLock` helper (four independent per-motor position PIDs — see that class's header for why this doesn't need whole-body state to work correctly). Neither controller does steering/yaw mixing yet, and neither reads `HEIGHT_SET`/`LEANOVER` — see below.
+
+### Planned robot mode state machine (not yet implemented)
+
+The channel map now reflects the intended final control scheme, but most of it isn't wired into actual robot behavior yet — this section documents that intent as a roadmap, not shipped code:
+
+- **`ROBOT_CAR`** — armed, mode switch in "drive" (low): hips held at a fixed crouch (existing `HipLock`, unchanged), wheels driven directly from `YAW_STICK`/`VEL_TGT` (differential yaw + common-mode velocity), no balancing.
+- **Stand-up transition** (mode switch flipped car→balance while armed): sticks ignored; the robot uses the wheels to tip up while the leg length ramps from fully crouched up to standing height, until pitch angle and rate settle.
+- **`ROBOT_BALANCING`**, extended: once standing, `YAW_STICK`/`VEL_TGT`/`HEIGHT_SET`/`LEANOVER` all become live — velocity target and yaw as today's PID cascade would use them, plus a height/lean outer loop commanding leg length and lean angle.
+- **Crouch transition** (mode switch flipped balance→car while armed): legs lower to fully crouched, then control hands off back to `ROBOT_CAR`'s direct wheel mixing.
+
+`MODE_SW` already switches the state machine between `ROBOT_CAR` and `ROBOT_BALANCING` (armed) / `ROBOT_IDLE` (disarmed) — `tools/targets_test.py` shows this live. But none of the transition logic, `ROBOT_CAR`'s wheel mixing, or the height/lean outer loop exist yet: `ROBOT_CAR` currently just zero-torques (identical to `ROBOT_IDLE`) rather than driving the wheels. All of the real behavior depends on real leg-length feedback (`FiveBarIK`, `controls_plan.md` sections 2–3), which is itself pending — see the TODO list at the top of this file. Until then, `HEIGHT_SET`/`LEANOVER` are read into `g_input[]` (so the wiring is ready) but consumed by nothing.
 
 ### ActuatorSafety
 
@@ -274,6 +320,8 @@ pip install pyserial rich
 python3 tools/telemetry.py telemetry     # live attitude + IMU dashboard (DEBUG build)
 python3 tools/telemetry.py ekf-status    # per-lane EKF angles
 python3 tools/motor_test.py motor-test   # CAN motor status
+python3 tools/radio_test.py rc-status    # live SBUS channel monitor
+python3 tools/targets_test.py tgt-status # live system targets + state machine mode
 python3 tools/can_tools.py can-status    # FDCAN1/2 register dump
 python3 tools/can_tools.py can-scan      # sniff all CAN IDs on bus 1
 python3 tools/logs.py logs list          # list SD card logs

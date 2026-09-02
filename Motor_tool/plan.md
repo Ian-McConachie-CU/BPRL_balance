@@ -1,36 +1,144 @@
 # Motor_tool: Status, Tool Reference, and Testing Plan
 
-## Current status (2026-08-31)
-
-Every device has been individually confirmed working over CAN at some point
-this bring-up. All hardware is now physically connected simultaneously for
-the first time:
+## Current status (2026-09-01)
 
 | Device | Bus | Addressing | Status |
 |---|---|---|---|
-| Hip 1–4 (LK-TECH MG8016E-i6) | 1 | CAN ID 1–4, reply on same ID (`0x140+ID`) | Confirmed individually and together; **currently affected by the open bus-1 issue below** |
-| Wheel 1 (SteadyWin GIM6010-6) | 1 | CAN ID 15, **reply on ID 16** (Host/Master CAN ID; moved from 10/11) | Currently affected by the open bus-1 issue below |
-| Wheel 2 (SteadyWin GIM6010-6) | 1 | CAN ID 20, **reply on ID 21** | Same as Wheel 1 |
+| Hip 1–4 (LK-TECH MG8016E-i6) | 1 | CAN ID 1–4, reply on same ID (`0x140+ID`) | **Confirmed healthy** — individually, together, and used as the known-good control device in the wheel-motor fault isolation below |
+| Wheel 1 (SteadyWin GIM6010-6) | 1 | CAN ID 15, **reply on ID 16** (Host/Master CAN ID; moved from 10/11) | **Hardware fault — damaged CAN transceiver, confirmed 2026-09-01.** Off the shared bus until repaired/replaced. See "Wheel motor CAN failure" below. |
+| Wheel 2 (SteadyWin GIM6010-6) | 1 | CAN ID 20, **reply on ID 21** | **Same fault, confirmed independently.** Off the shared bus until repaired/replaced. |
 | IMX5 IMU | 2 | Standard IDs 0x01–0x04, passive stream (no request needed) | Confirmed working throughout |
 | Current sensor | 2 | Unknown | **Not supported by this tool** — no protocol reference obtained yet, see below |
 
-**Open issue (2026-08-31, unresolved):** every RMD *and* GIM request now
-fails at the firmware TX level (`can_send()`/`canTransmitTimeout()` itself
-returning `ERR`, not just "no reply") — 16/16 RMD sends failed identically
-across two consecutive `poll hips` runs, right after GIM showed the same
-signature in the prior session. Since this now affects **both** drivers,
-which don't share any command code, the original "IMU traffic preempting
-the GIM command thread" hypothesis is superseded — this looks like a
-**bus-1-wide condition**, most likely bus-off (accumulated TX errors →
-the CAN controller refuses to transmit at all, to any ID, until reset or
-recovered), plausibly triggered by a wiring/termination change when all 6
-motors were connected together for the first time. `selftest` on bus 1 was
-requested as the next diagnostic (internal loopback, no external wiring
-dependency, and resets the peripheral as a side effect — would clear a
-bus-off condition if that's what this is) but the result hadn't come back
-as of this note. **Do not trust "not working" reports for any RMD/GIM
-command until this is resolved** — it isn't informative about that specific
-motor while the whole bus is down.
+**Resolved (2026-09-01): the 2026-08-31 bus-1-wide TX-failure issue below.**
+Root cause was a real gap in the FDCAN config, not a wiring mystery — see
+"CAN driver robustness fix" below. `selftest`'s recovery was a workaround,
+not a diagnosis; the actual fix is now in firmware.
+
+<details>
+<summary>Original 2026-08-31 issue note (kept for history)</summary>
+
+Every RMD *and* GIM request failed at the firmware TX level
+(`can_send()`/`canTransmitTimeout()` itself returning `ERR`, not just "no
+reply") — 16/16 RMD sends failed identically across two consecutive
+`poll hips` runs, right after GIM showed the same signature in the prior
+session. Since this affected **both** drivers, which don't share any
+command code, the original "IMU traffic preempting the GIM command thread"
+hypothesis was superseded in favor of a bus-1-wide condition, most likely
+bus-off.
+
+</details>
+
+---
+
+## CAN driver robustness fix (2026-09-01)
+
+Root cause of the 2026-08-31 bus-1-wide TX-failure issue, found by reading
+`third_party/ChibiOS/.../FDCANv1/hal_can_lld.c` and this project's
+`CAN.cpp` against each other:
+
+- **`CCCR_DAR` (Disable Automatic Retransmission) was never set.** With it
+  off (the hardware reset default — nobody had deliberately chosen either
+  way), a frame that gets no ACK isn't dropped, it's retried by the FDCAN
+  hardware immediately and indefinitely — monopolizing the bus and racking
+  up TEC until bus-off. This is exactly what "poll wheels never gives up
+  polling, and poll hips can't get a word in afterward" looked like.
+- **Nothing in this codebase ever recovers from bus-off.** ChibiOS's FDCAN
+  LLD (`can_lld_serve_interrupt()`) only wires up RX-full/overflow/TX-complete
+  interrupts — `FDCAN_IR_BO` is never enabled or handled, here or anywhere
+  in application code. Once TEC latches past 255, the peripheral goes
+  silent forever. `selftest` only ever "fixed" this as an incidental side
+  effect of reconfiguring the peripheral for loopback mode, which happens
+  to cycle `CCCR.INIT` — not a real recovery path.
+
+**Fix, applied to both `Motor_tool/src/CAN.cpp` and `src/coms/CAN.cpp`**
+(kept identical per this file's own header comment) — both rebuild clean,
+full link succeeds for `MOTOR_TOOL.elf` and `BPRL_BALANCE.elf`:
+1. `can_cfg.CCCR` now sets `FDCAN_CCCR_DAR` — an unacked frame is dropped
+   after one attempt instead of retried forever. Every motor command here
+   is reissued every cycle anyway, so a dropped frame is self-healing on
+   the next tick.
+2. New `can_check_busoff(CanBus)` — reads `PSR.BO`, and if set, clears
+   `CCCR.INIT` to re-trigger the standard ISO 11898-1 bus-off recovery
+   sequence (128×11 consecutive recessive bits, handled entirely in
+   hardware from there). Polled every iteration of the existing CAN RX loop
+   (`CANRxThread` here, `CANThread` in the robot firmware) — no new ISR.
+
+**New tool: `find gim [id_lo] [id_hi]`** in `tools/motor_tool.py` (default
+1–32). Blind-scans a CAN ID range for a GIM wheel motor by sending a
+one-shot `0xB2` Get Fault probe per ID and watching **all** bus-1 traffic
+(not just the ID probed) for a reply, since GIM's reply can land on a
+different SID than the command. On a hit, learns the reply-ID mapping into
+`DEFAULT_GIM_MASTER_IDS` and runs a full `poll gim` to confirm the
+connection end-to-end. Only safe to run broadly *because* of the DAR fix
+above — before that fix, a blind sweep against dead IDs would have
+retry-stormed the bus on every miss.
+
+---
+
+## Wheel motor CAN failure — root cause found (2026-09-01)
+
+Both wheel motors were confirmed working over CAN earlier in this bring-up
+(see the original status table above) — this is damage sustained *during*
+bring-up, not a factory defect on either unit. Full isolation process, in
+order, each step's result is a real finding, not just a discarded guess:
+
+1. **Bit timing confirmed correct (1 MHz)** on a scope capture of a
+   malformed Wheel 1 reply — ruled out a GIM CAN-baud mismatch, which had
+   been the leading electrical hypothesis going into this session.
+2. **GND wire (wheel motors' 3rd CAN pin, absent on hips) removed** —
+   no change. Ruled out a ground-loop via the redundant GND path.
+3. **CAN-H/CAN-L swap tested** (and wiring separately re-confirmed correct
+   against the silkscreen labels on both motor and FC) — no change, and
+   swapping did **not** damage anything (CAN transceivers are designed to
+   tolerate H/L reversal per ISO 11898-2's fault-tolerance provisions).
+   Ruled out reversed polarity.
+4. **Supply dropped from 41V to 24V** — no change to either the malformed
+   reply from power-on or the ~30s-onset oscillation. Ruled out "41V is too
+   high for the drive's internal regulator," which had been a live
+   hypothesis (`CAN_config.md` had flagged the GIM6010-6's input voltage
+   range as unstated by the vendor).
+5. **Decisive test: bus voltage with the motor unpowered.** A healthy,
+   unpowered CAN node must present high impedance — recessive should hold
+   ~2.5V regardless of whether that node has power. Both wheel motors,
+   unpowered but still wired to the bus, dragged the recessive level down
+   to ~1V. A known-good hip motor, unpowered, on the *identical* port and
+   wiring, caused **no** sag — ruling out the FC/Motor_tool's own CAN port
+   as the fault and isolating it to the wheel motors specifically.
+
+**Conclusion:** both GIM6010-6 drives have damaged CAN transceivers (or
+their ESD/clamp protection diodes) — a real electrical fault (low-impedance
+path on the bus pins even unpowered), not a wiring, grounding, protocol, or
+firmware issue. Every fix applied this session (DAR, bus-off recovery,
+termination discipline, correct addressing) is independently verified sound
+via the hip motors and via this isolation process; nothing about the CAN
+bus design is implicated.
+
+**Most likely cause:** the pre-fix bus-1 retry storm (see "CAN driver
+robustness fix" above) hammering a completely unterminated bus (no motor
+had its own 120Ω at the time; only the FC did) for an extended, undiagnosed
+period — continuous maximum-rate retransmission on a reflection-prone
+unterminated line is a much higher-stress condition than normal traffic,
+and the timing lines up with when these units were last known-good.
+Repeated hot-plugging during this session's own isolation tests (H/L swap,
+GND wire in/out) is a plausible compounding/secondary stress, though on its
+own a single clean swap test shouldn't damage a healthy part.
+
+**Status / next steps:**
+- Both wheel motors are off the shared bus 1 until repaired/replaced — a
+  node with a genuine pin-level fault can degrade signal quality for every
+  other node sharing the bus.
+- If a third/spare GIM6010-6 is available, test it in isolation first
+  (Phase 2-style, see below) to confirm the CAN wiring/protocol/tooling
+  built up this session is sound on a known-undamaged unit before drawing
+  any further conclusions.
+- Quantify each damaged unit's fault (CAN-H→GND, CAN-L→GND, CAN-H→CAN-L
+  resistance, unpowered and disconnected) — useful for a SteadyWin
+  repair/RMA conversation and not yet done.
+- Going forward, with any repaired/replacement units: terminate both
+  physical ends before extended multi-node testing, and power down before
+  making wiring changes — the discipline the phased test plan below was
+  already built around.
 
 ---
 

@@ -53,17 +53,23 @@ namespace StateIdx {
 }
 
 namespace InputIdx {
-    constexpr int THRUST      = 0; // forward/speed demand [0, 1] -- legacy drone-style
-                                    // throttle input, unused by the balance controllers
-    constexpr int ROLL_TGT    = 1; // lean / balance setpoint [-1, 1]
-    constexpr int PITCH_TGT   = 2; // pitch setpoint [-1, 1]
-    constexpr int YAW_RATE    = 3; // yaw rate demand [-1, 1]
-    constexpr int MODE_SW     = 4; // mode switch [-1,1]; <0=IDLE, >=0=BALANCE
-    constexpr int VEL_TGT     = 5; // forward velocity demand [-1, 1], scaled to m/s by
-                                    // the balance controller's own tunable max-velocity
-                                    // constant. RC channel/switch assignment not yet
-                                    // finalized on the transmitter -- see Radio.cpp.
-    constexpr int CTRL_SEL    = 6; // balance controller select: <0 = PID cascade,
-                                    // >=0 = LQR. RC channel TBD, see Radio.cpp.
-    constexpr int N_INPUTS    = 7;
+    // RC channel assignments below match the physical transmitter — see the
+    // channel-map table in Radio.hpp / README.md. Channels not listed here
+    // (arm switch, and the reserved Aux channels) either bypass g_input[]
+    // entirely (arm -> g_armed) or aren't wired to anything yet.
+    constexpr int YAW_STICK   = 0; // ch0: yaw stick [-1, 1]
+    constexpr int VEL_TGT     = 1; // ch1: forward velocity demand [-1, 1], scaled to
+                                    // m/s by the balance controller's own tunable
+                                    // max-velocity constant.
+    constexpr int HEIGHT_SET  = 2; // ch2: height-set switch [-1, 1] -- PLACEHOLDER,
+                                    // read into g_input[] but not yet consumed by any
+                                    // controller (needs FiveBarIK leg-length control,
+                                    // see controls_plan.md sections 2-3). RadioThread
+                                    // forces this to 0 on arm until the stick is first
+                                    // brought back to zero, reset every disarm -- see
+                                    // threads.cpp.
+    constexpr int LEANOVER    = 3; // ch3: leanover switch [-1, 1] -- PLACEHOLDER, ditto.
+    constexpr int MODE_SW     = 4; // ch6 (AuxB): car/balance mode select [-1,1];
+                                    // <0=IDLE/CAR, >=0=BALANCE (see RobotStateMachine).
+    constexpr int N_INPUTS    = 5;
 }

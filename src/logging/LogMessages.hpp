@@ -63,10 +63,10 @@ struct __attribute__((packed)) LogMsgLIN {
 struct __attribute__((packed)) LogMsgRCIN {
     uint64_t time_us;
     uint16_t rate_hz;
-    float    roll_stk;    // [-1, 1]  roll setpoint from RC
-    float    pitch_stk;   // [-1, 1]  pitch setpoint from RC
-    float    yaw_stk;     // [-1, 1]  yaw rate demand from RC
-    float    thr_stk;     // [0, 1]   throttle from RC
+    float    yaw_stk;     // [-1, 1]  yaw stick (ch0)
+    float    vel_stk;     // [-1, 1]  forward velocity target (ch1)
+    float    height_stk;  // [-1, 1]  height-set switch (ch2) -- placeholder, unconsumed
+    float    lean_stk;    // [-1, 1]  leanover switch (ch3) -- placeholder, unconsumed
     uint8_t  armed;       // 0=disarmed, 1=armed
 };
 // Format: "QHffffB"   Body: 8+2+4×4+1 = 27 B   Record: 30 B
@@ -107,7 +107,7 @@ constexpr LogDef kLogDefs[] = {
     { LOG_MSG_RCIN,
       "RCIN",
       "QHffffB",
-      "TimeUS,Rate,RollStk,PitchStk,YawStk,ThrStk,Armed",
+      "TimeUS,Rate,YawStk,VelStk,HeightStk,LeanStk,Armed",
       sizeof(LogMsgRCIN) },
 
     { LOG_MSG_OUTP,

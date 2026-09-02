@@ -6,13 +6,21 @@
  * FDCAN1/2 bit timing — 1 Mbit/s, PLL2Q = 80 MHz.
  * BRP=5, TSEG1=13, TSEG2=2 → 16 Tq/bit, 87.5% sample point.
  * NBTP: NSJW=0, NBRP=4, NTSEG1=12, NTSEG2=1.
+ *
+ * CCCR_DAR (Disable Automatic Retransmission): without this, an unacked
+ * frame (e.g. a motor that never answers) gets retried by the FDCAN
+ * hardware immediately and indefinitely — not just slow, but monopolizing
+ * the bus and racking up TEC until bus-off, discovered 2026-09-01 bringing
+ * up the wheel motors. Every motor command here is already reissued every
+ * control cycle, so a dropped frame is self-healing on the next tick; there
+ * is no reason to let the hardware retry-storm a stale one instead.
  */
 static const CANConfig can_cfg = {
-    0x00040C01,   // NBTP
-    0x00000000,   // DBTP
-    0x00000000,   // CCCR
-    0x00000000,   // TEST
-    0x00000000,   // RXGFC: accept all in RxFIFO0
+    0x00040C01,          // NBTP
+    0x00000000,          // DBTP
+    FDCAN_CCCR_DAR,       // CCCR
+    0x00000000,          // TEST
+    0x00000000,          // RXGFC: accept all in RxFIFO0
 };
 
 /* ── Per-bus device tables ───────────────────────────────────────────────── */
@@ -128,6 +136,16 @@ bool can_send(CanBus bus, uint32_t sid, const uint8_t *data, uint8_t dlc,
     for (int i = 0; i < dlc; i++) txf.data8[i] = data[i];
     return canTransmitTimeout(drv, CAN_ANY_MAILBOX, &txf,
                               TIME_MS2I(timeout_ms)) == MSG_OK;
+}
+
+/* ── Bus-off detection/recovery ─────────────────────────────────────────── */
+
+void can_check_busoff(CanBus bus)
+{
+    CANDriver *drv = (bus == CAN_BUS_1) ? &CAND1 : &CAND2;
+    if ((drv->fdcan->PSR & FDCAN_PSR_BO) != 0U) {
+        drv->fdcan->CCCR &= ~FDCAN_CCCR_INIT;
+    }
 }
 
 void can_get_diag(CanBus bus, CANDiag &out)
