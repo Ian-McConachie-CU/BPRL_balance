@@ -7,6 +7,7 @@
 | Hip 1–4 (LK-TECH MG8016E-i6) | 1 | CAN ID 1–4, reply on same ID (`0x140+ID`) | **Confirmed healthy** — individually, together, and used as the known-good control device in the wheel-motor fault isolation below |
 | Wheel 1 (SteadyWin GIM6010-6) | 1 | CAN ID 15, **reply on ID 16** (Host/Master CAN ID; moved from 10/11) | **Hardware fault — damaged CAN transceiver, confirmed 2026-09-01.** Off the shared bus until repaired/replaced. See "Wheel motor CAN failure" below. |
 | Wheel 2 (SteadyWin GIM6010-6) | 1 | CAN ID 20, **reply on ID 21** | **Same fault, confirmed independently.** Off the shared bus until repaired/replaced. |
+| Wheel L/R (SteadyWin GIM6010-8 on GDS68, ODrive fw) | 1 | node_id 2 (L) / 3 (R), ODrive CAN Simple (`node_id<<5\|cmd_id`) | **New hardware, replacing the damaged GIM6010-6 pair above.** `Motor_tool/src/OdriveMotor.*` added 2026-09-02 — `find odrive` / `ODRIVE,LIST` discovers nodes passively via Heartbeat, no probing needed. Not yet bench-tested against real GDS68 traffic — Set_Axis_State/Set_Controller_Mode/Set_Input_Vel are protocol-confirmed (see README confidence table) but this specific firmware path is unverified. |
 | IMX5 IMU | 2 | Standard IDs 0x01–0x04, passive stream (no request needed) | Confirmed working throughout |
 | Current sensor | 2 | Unknown | **Not supported by this tool** — no protocol reference obtained yet, see below |
 
@@ -177,6 +178,18 @@ own a single clean swap test shouldn't damage a healthy part.
 | `poll wheels [pairs]` | Purpose-built for the CAN-ID-vs-reply-ID question specifically — shows a plain-language verdict per wheel ("replies land on Master CAN ID X, not CAN ID Y"). This is what found the reply-ID bug in the first place. |
 | `gim <id> start\|stop\|pause\|torque\|velocity\|position\|fault\|ackfault\|ind\|masterid` | Direct low-level commands. `masterid` sets/queries the reply-ID override for that motor (`GIM,<id>,MASTERID,<reply_id>`) — this is what `ensure_gim_reply_ids` calls under the hood. |
 | `gim limit [Nm]` / `gim kt [Nm/A]` / `gim gear [ratio]` | Global (not per-id) torque clamp and torque-feedback-decode constants. |
+
+### Wheels — GDS68 / SteadyWin GIM6010-8 on ODrive firmware (bus 1, node_id 2/3)
+
+| Command | Tests |
+|---|---|
+| `find odrive [seconds]` | **The scan command.** Passively listens for Heartbeat (default 2s) and lists every node_id seen — no active probing needed, unlike `find gim`, since an ODrive axis broadcasts Heartbeat unconditionally once powered. This is what to run first for new/unknown GDS68 hardware. |
+| `poll` / `status` | `STATUS,ODRIVE,...` rows are included in the aggregate status table automatically once a node has ever heartbeated — the ODrive driver subscribes and decodes in the background from boot, same as `find odrive`. |
+| `odrive <id> start` | `Set_Controller_Mode(TORQUE,PASSTHROUGH)` then `Set_Axis_State(CLOSED_LOOP)` — required before torque/velocity commands do anything. |
+| `odrive <id> idle` / `stop` | `Set_Axis_State(IDLE)` — also what the 500ms host watchdog and `STOP,ALL` send to every node that's ever reported. |
+| `odrive <id> mode torque\|velocity` | `Set_Controller_Mode` |
+| `odrive <id> torque <Nm>` / `odrive <id> velocity <rad/s>` | `Set_Input_Torque` / `Set_Input_Vel`, output-shaft-referenced (gear-divided/multiplied by `odrive gear`, default 8) |
+| `odrive gear [ratio]` / `odrive limit [Nm]` | Global (not per-id) gear ratio and torque clamp, same pattern as `gim gear`/`gim limit` |
 
 ### IMX5 IMU (bus 2)
 

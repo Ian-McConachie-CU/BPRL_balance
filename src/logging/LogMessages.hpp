@@ -27,6 +27,13 @@ constexpr uint8_t LOG_MSG_ATT  = 0x09U;  // angular states: attitude + rates + a
 constexpr uint8_t LOG_MSG_LIN  = 0x0AU;  // linear states: position + velocity + linear accel
 constexpr uint8_t LOG_MSG_RCIN = 0x05U;  // RC stick inputs + arm state
 constexpr uint8_t LOG_MSG_OUTP = 0x06U;  // motor torque commands [Nm] × 4 (first 4 of 6)
+constexpr uint8_t LOG_MSG_HIPS = 0x07U;  // hip encoder position [rad] + bus voltage [V] × 4
+constexpr uint8_t LOG_MSG_HERR = 0x08U;  // hip latched error-flag bitmask × 4
+constexpr uint8_t LOG_MSG_LEGS = 0x0BU;  // per-leg length/pitch + rates, from FiveBarIK × 2
+constexpr uint8_t LOG_MSG_LEGV = 0x0CU;  // per-leg foot-point Cartesian velocity [m/s] × 2
+constexpr uint8_t LOG_MSG_MOTV = 0x0DU;  // hip + wheel velocity [rad/s], all 6 motors
+constexpr uint8_t LOG_MSG_PWR  = 0x0EU;  // battery voltage (hip avg), power-monitor voltage, total current
+constexpr uint8_t LOG_MSG_VNED = 0x0FU;  // world/NED-frame velocity (derived, not a Kalman state)
 
 /* ── Packed message bodies ───────────────────────────────────────────────── */
 
@@ -65,11 +72,14 @@ struct __attribute__((packed)) LogMsgRCIN {
     uint16_t rate_hz;
     float    yaw_stk;     // [-1, 1]  yaw stick (ch0)
     float    vel_stk;     // [-1, 1]  forward velocity target (ch1)
-    float    height_stk;  // [-1, 1]  height-set switch (ch2) -- placeholder, unconsumed
+    float    height_stk;  // [-1, 1]  height-set switch (ch2) -- live in ROBOT_BALANCING
+                            // under BALANCE_CTRL_LQR (see LqrBalanceController.hpp),
+                            // unconsumed in every other mode
     float    lean_stk;    // [-1, 1]  leanover switch (ch3) -- placeholder, unconsumed
     uint8_t  armed;       // 0=disarmed, 1=armed
+    uint8_t  mode;        // RobotMode: 0=IDLE, 1=STANDING_UP, 2=BALANCING, 3=CAR
 };
-// Format: "QHffffB"   Body: 8+2+4×4+1 = 27 B   Record: 30 B
+// Format: "QHffffBB"   Body: 8+2+4×4+1+1 = 28 B   Record: 31 B
 
 struct __attribute__((packed)) LogMsgOUTP {
     uint64_t time_us;
@@ -80,6 +90,83 @@ struct __attribute__((packed)) LogMsgOUTP {
     float    tq3;    // Nm  hip RR torque command
 };
 // Format: "QHffff"   Body: 8+2+4×4 = 26 B   Record: 29 B
+
+struct __attribute__((packed)) LogMsgHIPS {
+    uint64_t time_us;
+    uint16_t rate_hz;
+    float    pos0;    // rad  hip FL encoder position (motor-side, from 0xA1/0xA2 reply)
+    float    pos1;    // rad  hip FR
+    float    pos2;    // rad  hip RL
+    float    pos3;    // rad  hip RR
+    float    volt0;   // V    hip FL bus voltage (0x9A RMD status1 request, see CANMotor.cpp)
+    float    volt1;   // V    hip FR
+    float    volt2;   // V    hip RL
+    float    volt3;   // V    hip RR
+};
+// Format: "QHffffffff"   Body: 8+2+8×4 = 42 B   Record: 45 B
+
+struct __attribute__((packed)) LogMsgHERR {
+    uint64_t time_us;
+    uint16_t rate_hz;
+    uint8_t  err0;    // raw RMD errorState bitmask, hip FL (0 = no fault)
+    uint8_t  err1;    // hip FR
+    uint8_t  err2;    // hip RL
+    uint8_t  err3;    // hip RR
+};
+// Format: "QHBBBB"   Body: 8+2+1×4 = 14 B   Record: 17 B
+
+struct __attribute__((packed)) LogMsgLEGS {
+    uint64_t time_us;
+    uint16_t rate_hz;
+    float    L0;       // m    leg 0 (left) virtual leg length
+    float    L0dot;    // m/s
+    float    ThL0;     // rad  leg 0 hip-relative leg angle
+    float    ThL0dot;  // rad/s
+    float    L1;       // m    leg 1 (right)
+    float    L1dot;    // m/s
+    float    ThL1;     // rad
+    float    ThL1dot;  // rad/s
+};
+// Format: "QHffffffff"   Body: 8+2+8×4 = 42 B   Record: 45 B
+
+struct __attribute__((packed)) LogMsgLEGV {
+    uint64_t time_us;
+    uint16_t rate_hz;
+    float    leg0_xdot;   // m/s  leg 0 (left) foot-point velocity rel. to body, NED convention
+    float    leg0_zdot;   // m/s
+    float    leg1_xdot;   // m/s  leg 1 (right)
+    float    leg1_zdot;   // m/s
+};
+// Format: "QHffff"   Body: 8+2+4×4 = 26 B   Record: 29 B
+
+struct __attribute__((packed)) LogMsgMOTV {
+    uint64_t time_us;
+    uint16_t rate_hz;
+    float    hip_vel0;    // rad/s  hip FL
+    float    hip_vel1;    // rad/s  hip FR
+    float    hip_vel2;    // rad/s  hip RL
+    float    hip_vel3;    // rad/s  hip RR
+    float    wheel_vel0;  // rad/s  wheel L
+    float    wheel_vel1;  // rad/s  wheel R
+};
+// Format: "QHffffff"   Body: 8+2+6×4 = 34 B   Record: 37 B
+
+struct __attribute__((packed)) LogMsgPWR {
+    uint64_t time_us;
+    uint16_t rate_hz;
+    float    batt_v;    // V  battery voltage -- average of 4 hips' 0x9A telemetry
+    float    pmon_v;    // V  Matek CAN-L4-BM voltage (independent cross-check)
+    float    total_i;   // A  Matek CAN-L4-BM current
+};
+// Format: "QHfff"   Body: 8+2+3×4 = 22 B   Record: 25 B
+
+struct __attribute__((packed)) LogMsgVNED {
+    uint64_t time_us;
+    uint16_t rate_hz;
+    float    xdot_world;   // m/s  world/NED-frame forward velocity (derived, not a Kalman state)
+    float    zdot_world;   // m/s  world/NED-frame vertical velocity
+};
+// Format: "QHff"   Body: 8+2+2×4 = 18 B   Record: 21 B
 
 /* ── Log descriptor table ────────────────────────────────────────────────── */
 
@@ -106,8 +193,8 @@ constexpr LogDef kLogDefs[] = {
 
     { LOG_MSG_RCIN,
       "RCIN",
-      "QHffffB",
-      "TimeUS,Rate,YawStk,VelStk,HeightStk,LeanStk,Armed",
+      "QHffffBB",
+      "TimeUS,Rate,YawStk,VelStk,HeightStk,LeanStk,Armed,Mode",
       sizeof(LogMsgRCIN) },
 
     { LOG_MSG_OUTP,
@@ -115,6 +202,48 @@ constexpr LogDef kLogDefs[] = {
       "QHffff",
       "TimeUS,Rate,Tq0,Tq1,Tq2,Tq3",
       sizeof(LogMsgOUTP) },
+
+    { LOG_MSG_HIPS,
+      "HIPS",
+      "QHffffffff",
+      "TimeUS,Rate,Pos0,Pos1,Pos2,Pos3,Volt0,Volt1,Volt2,Volt3",
+      sizeof(LogMsgHIPS) },
+
+    { LOG_MSG_HERR,
+      "HERR",
+      "QHBBBB",
+      "TimeUS,Rate,Err0,Err1,Err2,Err3",
+      sizeof(LogMsgHERR) },
+
+    { LOG_MSG_LEGS,
+      "LEGS",
+      "QHffffffff",
+      "TimeUS,Rate,L0,L0dot,ThL0,ThL0dot,L1,L1dot,ThL1,ThL1dot",
+      sizeof(LogMsgLEGS) },
+
+    { LOG_MSG_LEGV,
+      "LEGV",
+      "QHffff",
+      "TimeUS,Rate,Leg0Xdot,Leg0Zdot,Leg1Xdot,Leg1Zdot",
+      sizeof(LogMsgLEGV) },
+
+    { LOG_MSG_MOTV,
+      "MOTV",
+      "QHffffff",
+      "TimeUS,Rate,HipVel0,HipVel1,HipVel2,HipVel3,WheelVel0,WheelVel1",
+      sizeof(LogMsgMOTV) },
+
+    { LOG_MSG_PWR,
+      "PWR",
+      "QHfff",
+      "TimeUS,Rate,BattV,PmonV,TotalI",
+      sizeof(LogMsgPWR) },
+
+    { LOG_MSG_VNED,
+      "VNED",
+      "QHff",
+      "TimeUS,Rate,XdotWorld,ZdotWorld",
+      sizeof(LogMsgVNED) },
 };
 
 constexpr size_t kNumLogDefs = sizeof(kLogDefs) / sizeof(kLogDefs[0]);

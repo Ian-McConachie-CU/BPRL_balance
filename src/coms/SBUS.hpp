@@ -23,6 +23,16 @@
  *
  * 16 channels packed as 11-bit values (range 172–1811, centre 992).
  * Flags byte (buf[23]): bit 2 = frame_lost, bit 3 = failsafe.
+ *
+ * frame_lost()/failsafe() only change value inside a successfully decoded
+ * frame -- they don't self-clear on their own. That's fine while the
+ * receiver is alive (it keeps sending failsafe-flagged frames when it
+ * loses the transmitter's RF signal), but if the wire itself goes dead
+ * (cable pulled, receiver powered off) bytes just stop arriving and both
+ * flags freeze at their last value forever. take_frame_received()/
+ * mark_stale() exist so the caller (RadioThread, threads.cpp) can run a
+ * tick-based watchdog on top and force the link back to the "no signal"
+ * state -- mirrors StateEstThread's CAN-IMU staleness counter.
  */
 class SbusParser {
 public:
@@ -31,6 +41,15 @@ public:
     uint16_t channel(uint8_t n) const; // raw 11-bit value for channel n (0–15)
     bool     frame_lost() const  { return _frame_lost; }
     bool     failsafe()   const  { return _failsafe;   }
+
+    // True if a full valid frame was decoded since the last call (consumes
+    // the flag). Drive a staleness watchdog off this, not frame_lost() --
+    // see class header.
+    bool     take_frame_received();
+    // Force frame_lost()/failsafe() back to their "no signal" default.
+    // Call from a watchdog once too much time has passed with no frame
+    // received, so a silently dead link still ends up disarmed.
+    void     mark_stale();
 
 private:
     static void unpack(const uint8_t *payload, uint16_t *ch);
@@ -41,6 +60,7 @@ private:
     uint16_t _ch[16]{};
     bool     _frame_lost{true};
     bool     _failsafe{true};
+    bool     _frame_received{false};
 };
 
 extern SbusParser g_sbus;

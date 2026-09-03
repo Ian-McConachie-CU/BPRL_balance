@@ -356,6 +356,19 @@ void EKF::update_wheel_velocity(float u_meas, float R_var)
     _update(1, H, R_diag, innov);
 }
 
+void EKF::update_leg_wheel_velocity(float u_meas, float w_meas, float Ru, float Rw)
+{
+    if (!_initialized) return;
+
+    float H[2][N] = {};
+    H[0][iU] = 1.0f;
+    H[1][iW] = 1.0f;
+
+    const float R_diag[2] = { Ru, Rw };
+    const float innov[2]  = { u_meas - _x[iU], w_meas - _x[iW] };
+    _update(2, H, R_diag, innov);
+}
+
 /* ══════════════════════════════════════════════════════════════════════════
  * Generic measurement update: m ≤ 6 measurements.
  *

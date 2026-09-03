@@ -136,6 +136,12 @@ DEFAULT_RMD_IDS = [1, 2, 3, 4]
 DEFAULT_GIM_IDS = [15, 20]
 DEFAULT_GIM_MASTER_IDS = {15: 16, 20: 21}   # CAN ID -> reply SID, per gim_set_reply_id()
 
+# Current wheels: Steadywin GIM6010-8 on a GDS68 board running ODrive
+# firmware (replaced the damaged GIM6010-6/SteadyWin-native drives — see
+# plan.md's "Wheel motor CAN failure"). node_ids match these drives' own
+# existing ODrive config, per BPRL_balance/main.cpp: wheel L=2, wheel R=3.
+DEFAULT_ODRIVE_IDS = [2, 3]
+
 
 def ensure_gim_reply_ids(ser, gim_ids, master_map=None):
     """Push gim_set_reply_id() to the firmware for every id in gim_ids that
@@ -232,8 +238,11 @@ def cmd_status(ser):
     gim_tbl = Table(title="GIM (GIM6010-6)", show_header=True, header_style="bold")
     for col in ["ID", "pos", "vel", "torque", "temp", "fault", "last indicator", "enabled", "age (ms)"]:
         gim_tbl.add_column(col, justify="right")
+    odrive_tbl = Table(title="ODRIVE (GDS68 / GIM6010-8)", show_header=True, header_style="bold")
+    for col in ["node_id", "pos (rad)", "vel (rad/s)", "axis_state", "axis_error", "age (ms)"]:
+        odrive_tbl.add_column(col, justify="right")
 
-    any_rmd = any_gim = any_imu = False
+    any_rmd = any_gim = any_odrive = any_imu = False
     seen_rmd, seen_gim = set(), set()
     for line in lines:
         m = re.match(r"STATUS,RMD,(\d+),pos=([-\d.]+),vel=([-\d.]+),tq=([-\d.]+),"
@@ -254,6 +263,13 @@ def cmd_status(ser):
                              "0x" + m.group(6), f"#{m.group(7)}={m.group(8)}",
                              "yes" if m.group(9) == "1" else "no", m.group(11))
             continue
+        m = re.match(r"STATUS,ODRIVE,(\d+),pos=([-\d.]+),vel=([-\d.]+),"
+                      r"axis_state=(\d+),axis_error=0x([0-9a-fA-F]+),age_ms=(\d+)", line)
+        if m:
+            any_odrive = True
+            odrive_tbl.add_row(m.group(1), m.group(2), m.group(3), m.group(4),
+                                "0x" + m.group(5), m.group(6))
+            continue
         if line.startswith("IMU,STATUS,"):
             # This was previously dropped silently — STATUS never showed IMU
             # data even when it was working; 'imu'/'imu <seconds>' is the
@@ -266,7 +282,9 @@ def cmd_status(ser):
         console.print(rmd_tbl)
     if any_gim:
         console.print(gim_tbl)
-    if not any_rmd and not any_gim and not any_imu:
+    if any_odrive:
+        console.print(odrive_tbl)
+    if not any_rmd and not any_gim and not any_odrive and not any_imu:
         console.print("[dim]No motors have reported feedback yet.[/dim]")
     return seen_rmd, seen_gim
 
@@ -810,6 +828,39 @@ def cmd_find_gim(ser, id_lo=1, id_hi=32, per_id_timeout=0.25):
     return hits
 
 
+def cmd_find_odrive(ser, seconds=2.0):
+    """Scan for a GDS68 (Steadywin GIM6010-8 on ODrive firmware) by listening
+    for Heartbeat frames — unlike find_gim, no active probing is needed: an
+    ODrive axis broadcasts Heartbeat continuously and unconditionally
+    (~10 Hz default) the moment it's powered, and OdriveMotor.cpp has been
+    passively decoding it in the background since the firmware booted.
+    ODRIVE,LIST just reads whatever's already been overheard, so this is
+    really just 'wait a moment, then ask what's been seen' — the wait is
+    only there in case the tool was *just* started and hasn't had a
+    heartbeat period yet."""
+    console.print(f"[dim]Listening for GDS68/ODrive heartbeats on bus 1 for {seconds:.1f}s...[/dim]")
+    time.sleep(seconds)
+    send(ser, "ODRIVE,LIST")
+    lines = read_lines_until(ser, "ODRIVE,LIST,END", timeout=2.0)
+
+    hits = []
+    for line in lines:
+        m = re.match(r"ODRIVE,LIST,id=(\d+),axis_state=(\d+),axis_error=0x([0-9a-fA-F]+),age_ms=(\d+)", line)
+        if m:
+            hits.append((int(m.group(1)), int(m.group(2)), m.group(3), int(m.group(4))))
+
+    if not hits:
+        console.print("[yellow]No ODrive heartbeats seen. Check power/wiring/termination on bus 1, "
+                       "or that the GDS68 is actually running ODrive firmware and configured for CAN.[/yellow]")
+        return []
+
+    console.print(f"[bold green]Found {len(hits)} GDS68/ODrive node(s):[/bold green]")
+    for node_id, axis_state, axis_error, age_ms in hits:
+        err_tag = "" if axis_error == "00000000" else f"  [red]axis_error=0x{axis_error}[/red]"
+        console.print(f"  node_id {node_id}  axis_state={axis_state}  last_seen={age_ms}ms ago{err_tag}")
+    return hits
+
+
 _RMD_STATUS_RE = re.compile(
     r"STATUS,RMD,(\d+),pos=([-\d.]+),vel=([-\d.]+),tq=([-\d.]+),"
     r"temp=([-\d.]+),volt=([-\d.]+),err=0x([0-9a-fA-F]+),age_ms=(\d+)")
@@ -1182,6 +1233,7 @@ def print_help():
   poll gim [gim_id ...]                   poll GIM wheels with CAN monitor running; show raw bytes + independent decode per ID
   poll wheels [can_id master_id ...]      check BOTH CAN ID and Master CAN ID per wheel for replies (default: 15/16, 20/21)
   find gim [id_lo] [id_hi]                blind-scan CAN IDs id_lo-id_hi (default 1-32) for a GIM wheel motor; on a hit, learns its reply ID and confirms the connection (poll gim). Safe now that DAR is enabled — a dead ID just fails once instead of retry-storming the bus.
+  find odrive [seconds]                   scan for a GDS68/ODrive node (default 2s) — passive, just listens for Heartbeat broadcasts, no probing needed
   test hips [rmd_id ...]                  MOVES hips (one at a time) to 0deg then 120deg; confirms before moving anything
   test drift [rmd_id ...]                 no motion — samples encoder for 5s, reports if it moves while nominally still
   scan [seconds]                          ID scanner on the active bus
@@ -1213,6 +1265,14 @@ def print_help():
   gim <id> masterid <reply_id>             set the SID this id's replies actually arrive on (Host/Master CAN ID, confirmed to differ per motor)
   gim limit [Nm]                           get/set the GIM torque clamp
   gim kt [Nm_per_A] / gim gear [ratio]     set the constants used to decode GIM torque feedback
+
+  odrive <id> start                        GDS68/ODrive: torque-control mode + closed-loop
+  odrive <id> idle | stop                  GDS68/ODrive: Set_Axis_State(IDLE)
+  odrive <id> mode torque|velocity         GDS68/ODrive: Set_Controller_Mode
+  odrive <id> torque <Nm>                  GDS68/ODrive: torque command, output-shaft-referenced (clamped)
+  odrive <id> velocity <rad/s>             GDS68/ODrive: velocity command, output-shaft-referenced
+  odrive gear [ratio]                      get/set the GIM6010-8 gear ratio used for scaling/decode
+  odrive limit [Nm]                        get/set the ODrive torque clamp
 
   stop                                    STOP,ALL — zero/disable everything now
   raw <line>                              send a raw firmware command line verbatim
@@ -1259,6 +1319,9 @@ def repl(ser):
             id_lo = int(parts[2]) if len(parts) > 2 else 1
             id_hi = int(parts[3]) if len(parts) > 3 else 32
             cmd_find_gim(ser, id_lo, id_hi)
+        elif cmd == "find" and len(parts) > 1 and parts[1].lower() == "odrive":
+            secs = float(parts[2]) if len(parts) > 2 else 2.0
+            cmd_find_odrive(ser, secs)
         elif cmd == "poll":
             rmd_ids = [int(p) for p in parts[1:]] if len(parts) > 1 else DEFAULT_RMD_IDS
             cmd_poll(ser, rmd_ids, DEFAULT_GIM_IDS)
@@ -1301,6 +1364,8 @@ def repl(ser):
             handle_rmd(ser, parts[1:])
         elif cmd == "gim" and len(parts) >= 2:
             handle_gim(ser, parts[1:])
+        elif cmd == "odrive" and len(parts) >= 2:
+            handle_odrive(ser, parts[1:])
         else:
             console.print("[dim]Unknown command — type 'help'.[/dim]")
 
@@ -1384,6 +1449,42 @@ def handle_gim(ser, args):
             send(ser, f"GIM,{mid},MASTERID,{args[2]}")
         else:
             console.print(f"[red]Unknown gim subcommand: {sub}[/red]")
+            return
+    except IndexError:
+        console.print("[red]Missing argument(s).[/red]")
+        return
+    for l in read_lines_until(ser, None, timeout=1.0):
+        console.print(l)
+
+
+def handle_odrive(ser, args):
+    if args[0] == "limit":
+        send(ser, f"ODRIVE,LIMIT,{args[1]}" if len(args) > 1 else "ODRIVE,LIMIT,")
+        for l in read_lines_until(ser, None, timeout=1.0):
+            console.print(l)
+        return
+    if args[0] == "gear":
+        send(ser, f"ODRIVE,GEAR,{args[1]}" if len(args) > 1 else "ODRIVE,GEAR,")
+        for l in read_lines_until(ser, None, timeout=1.0):
+            console.print(l)
+        return
+    if len(args) < 2:
+        console.print("[red]Usage: odrive <id> <start|idle|stop|mode|torque|velocity> ...[/red]")
+        return
+    mid, sub = args[0], args[1].lower()
+    try:
+        if sub == "start":
+            send(ser, f"ODRIVE,{mid},START")
+        elif sub in ("idle", "stop"):
+            send(ser, f"ODRIVE,{mid},IDLE")
+        elif sub == "mode":
+            send(ser, f"ODRIVE,{mid},MODE,{args[2].upper()}")
+        elif sub == "torque":
+            send(ser, f"ODRIVE,{mid},TORQUE,{args[2]}")
+        elif sub == "velocity":
+            send(ser, f"ODRIVE,{mid},VELOCITY,{args[2]}")
+        else:
+            console.print(f"[red]Unknown odrive subcommand: {sub}[/red]")
             return
     except IndexError:
         console.print("[red]Missing argument(s).[/red]")

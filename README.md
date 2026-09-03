@@ -19,7 +19,9 @@ Forked from BPRL_flight; drone-specific code removed and replaced with dual-bus 
   `controls_plan.md`) — needed before the LQR controller can use real
   theta/thetadot instead of its current 0 placeholder, and before
   `InputIdx::HEIGHT_SET` / `LEANOVER` (already wired, see section 2 below)
-  or the planned CAR mode / stand-up-crouch transitions can be implemented.
+  or the stand-up/crouch transitions between `ROBOT_CAR` and
+  `ROBOT_BALANCING` can be implemented (`ROBOT_CAR`'s own direct wheel drive
+  is implemented and doesn't need this — see section 4 below).
 - Register IMU and current sensor callbacks on FDCAN2 (CAN bus 2).
 - Implement SDC102 CAN protocol for Steadywin GIM6010-6 wheel motors.
 - Add firmware-side USB command handlers for `MOTOR,torque` and `MOTOR,velocity`.
@@ -190,8 +192,8 @@ Future: joint angles and joint rates will be appended beyond index 18 once leg k
 
 | Mode | Trigger | Action |
 |---|---|---|
-| `ROBOT_IDLE` | Disarmed | Zero torque on all motors |
-| `ROBOT_CAR` | Armed and `MODE_SW < 0` | **Stubbed** — zero torque, same as IDLE, but reported as a distinct mode; see planned mode state machine below |
+| `ROBOT_IDLE` | Disarmed | Zero torque on all motors (hard-set, including reverting the wheels out of ODrive velocity mode if `ROBOT_CAR` was active — see below) |
+| `ROBOT_CAR` | Armed and `MODE_SW < 0` | Calls `CarController`: hips left idling (zero torque, no crouch hold yet), wheels driven directly from `YAW_STICK`/`VEL_TGT` via the ODrive's own native velocity mode |
 | `ROBOT_BALANCING` | Armed and `MODE_SW ≥ 0` | Calls BalanceController |
 
 ### BalanceController
@@ -205,16 +207,21 @@ Dispatches between two balance controllers via the `BALANCE_CONTROLLER` **compil
 
 Both read velocity target from `input[InputIdx::VEL_TGT]` (ch1) and hold the hips via the shared `HipLock` helper (four independent per-motor position PIDs — see that class's header for why this doesn't need whole-body state to work correctly). Neither controller does steering/yaw mixing yet, and neither reads `HEIGHT_SET`/`LEANOVER` — see below.
 
-### Planned robot mode state machine (not yet implemented)
+### CarController
 
-The channel map now reflects the intended final control scheme, but most of it isn't wired into actual robot behavior yet — this section documents that intent as a roadmap, not shipped code:
+Runs in `ROBOT_CAR`: no balancing, hips left idling (zero torque — no crouch hold yet, see the roadmap below), wheels driven directly. `input[InputIdx::VEL_TGT]` scales linearly to a common-mode wheel velocity target (both wheels, same sign); `input[InputIdx::YAW_STICK]` adds a differential term on top, positive yaw (right turn) speeding up the left wheel and slowing the right. `HEIGHT_SET`/`LEANOVER` are not read.
 
-- **`ROBOT_CAR`** — armed, mode switch in "drive" (low): hips held at a fixed crouch (existing `HipLock`, unchanged), wheels driven directly from `YAW_STICK`/`VEL_TGT` (differential yaw + common-mode velocity), no balancing.
+Unlike every torque-driven controller above, the wheel targets go out via the ODrive's own native velocity mode rather than `motor_torques[4]/[5]` — a software torque-PID velocity loop was found (via `MotorTest`'s bench sweep) to stall under the wheels' own static friction, where the ODrive's own velocity controller tracks well. `RobotStateMachine::update()` switches ids 5/6 into/out of velocity mode on every `ROBOT_CAR` entry/exit edge (including disarm, which also hard-idles the wheels back in torque mode at zero); `WheelSendThread` (`threads.cpp`) sends the actual `can_motor_set_velocity()` commands every tick while `mode() == ROBOT_CAR`, bypassing `ActuatorSafety`'s torque-path limits entirely (its own `WHEEL_VEL_LIMIT_RADS` output clamp is the only guard here — see `CarController.hpp`).
+
+### Planned robot mode state machine (partially implemented)
+
+The channel map reflects the intended final control scheme; `ROBOT_CAR`'s direct wheel drive (above) is implemented, but the stand-up/crouch transitions and the `ROBOT_BALANCING` height/lean outer loop are not — this section documents the remaining roadmap:
+
 - **Stand-up transition** (mode switch flipped car→balance while armed): sticks ignored; the robot uses the wheels to tip up while the leg length ramps from fully crouched up to standing height, until pitch angle and rate settle.
 - **`ROBOT_BALANCING`**, extended: once standing, `YAW_STICK`/`VEL_TGT`/`HEIGHT_SET`/`LEANOVER` all become live — velocity target and yaw as today's PID cascade would use them, plus a height/lean outer loop commanding leg length and lean angle.
-- **Crouch transition** (mode switch flipped balance→car while armed): legs lower to fully crouched, then control hands off back to `ROBOT_CAR`'s direct wheel mixing.
+- **Crouch transition** (mode switch flipped balance→car while armed): legs lower to fully crouched, then control hands off back to `ROBOT_CAR`'s direct wheel mixing. `ROBOT_CAR` itself may also gain a fixed-crouch hip hold (`HipLock`) at that point instead of leaving the hips idling as it does now.
 
-`MODE_SW` already switches the state machine between `ROBOT_CAR` and `ROBOT_BALANCING` (armed) / `ROBOT_IDLE` (disarmed) — `tools/targets_test.py` shows this live. But none of the transition logic, `ROBOT_CAR`'s wheel mixing, or the height/lean outer loop exist yet: `ROBOT_CAR` currently just zero-torques (identical to `ROBOT_IDLE`) rather than driving the wheels. All of the real behavior depends on real leg-length feedback (`FiveBarIK`, `controls_plan.md` sections 2–3), which is itself pending — see the TODO list at the top of this file. Until then, `HEIGHT_SET`/`LEANOVER` are read into `g_input[]` (so the wiring is ready) but consumed by nothing.
+`MODE_SW` already switches the state machine between `ROBOT_CAR` and `ROBOT_BALANCING` (armed) / `ROBOT_IDLE` (disarmed) — `tools/targets_test.py` shows this live. All of the still-missing behavior above depends on real leg-length feedback (`FiveBarIK`, `controls_plan.md` sections 2–3), which is itself pending — see the TODO list at the top of this file. Until then, `HEIGHT_SET`/`LEANOVER` are read into `g_input[]` (so the wiring is ready) but consumed by nothing.
 
 ### ActuatorSafety
 

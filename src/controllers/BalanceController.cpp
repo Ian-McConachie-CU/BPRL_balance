@@ -10,3 +10,12 @@ void BalanceController::update(const float state[StateIdx::N],
     _pid.update(state, input, motor_torques);
 #endif
 }
+
+void BalanceController::reset(const float state[StateIdx::N])
+{
+#if BALANCE_CONTROLLER == BALANCE_CTRL_LQR
+    _lqr.reset(state);
+#else
+    (void)state;
+#endif
+}

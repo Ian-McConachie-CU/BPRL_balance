@@ -122,16 +122,22 @@ CSRC = $(ALLCSRC) \
 CPPSRC = $(ALLCPPSRC) \
          main.cpp \
          src/threads.cpp \
+         src/RobotTelemetry.cpp \
          src/math/math.cpp \
+         src/kinematics/FiveBarIK.cpp \
          src/state_estimator/EKF.cpp \
          src/state_estimator/StateManager.cpp \
          src/controllers/PID.cpp \
          src/controllers/RobotStateMachine.cpp \
          src/controllers/BalanceController.cpp \
+         src/controllers/CarController.cpp \
          src/controllers/PidBalanceController.cpp \
          src/controllers/LqrBalanceController.cpp \
+         src/controllers/StandUpController.cpp \
+         src/controllers/WheelBalanceLQR.cpp \
          src/controllers/HipLock.cpp \
          src/controllers/ActuatorSafety.cpp \
+         src/controllers/MotorTest.cpp \
          src/coms/IMUs/ICM42688.cpp \
          src/coms/IMUs/ICM45686.cpp \
          src/coms/SPI.cpp \

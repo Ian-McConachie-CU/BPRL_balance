@@ -13,6 +13,7 @@
 #include "src/CAN.hpp"
 #include "src/RmdMotor.hpp"
 #include "src/GimMotor.hpp"
+#include "src/OdriveMotor.hpp"
 #include "src/Imx5.hpp"
 #include "src/usb_serial.hpp"
 #include "chprintf.h"
@@ -54,6 +55,7 @@ static THD_FUNCTION(WatchdogThread, arg)
         if (now - s_last_host_ms > TIMEOUT_MS && now - last_stop_ms > RESEND_PERIOD_MS) {
             rmd_stop_all();
             gim_stop_all();
+            odrive_stop_all();
             last_stop_ms = now;
         }
         chThdSleepMilliseconds(20);
@@ -95,6 +97,14 @@ static const char *const kHelp =
     "  GIM,<id>,MASTERID,<reply_id>           GIM6010-6: set the SID this id's replies actually arrive on (Host/Master CAN ID)\r\n"
     "  GIM,LIMIT,<Nm>                        set/query the GIM torque clamp\r\n"
     "  GIM,KT,<Nm_per_A> / GIM,GEAR,<ratio>  set the constants used to decode GIM torque feedback\r\n"
+    "  ODRIVE,LIST                           list node_ids seen via Heartbeat -- the GDS68 scanner (no probing needed)\r\n"
+    "  ODRIVE,<id>,START                     GDS68/ODrive: torque-control mode + closed-loop (0x0B+0x07)\r\n"
+    "  ODRIVE,<id>,IDLE|STOP                 GDS68/ODrive: Set_Axis_State(IDLE) (0x07)\r\n"
+    "  ODRIVE,<id>,MODE,TORQUE|VELOCITY      GDS68/ODrive: Set_Controller_Mode (0x0B)\r\n"
+    "  ODRIVE,<id>,TORQUE,<Nm>                GDS68/ODrive: Set_Input_Torque, output-referenced (0x0E)\r\n"
+    "  ODRIVE,<id>,VELOCITY,<rad/s>           GDS68/ODrive: Set_Input_Vel, output-referenced (0x0D)\r\n"
+    "  ODRIVE,GEAR,<ratio>                    get/set the GIM6010-8 gear ratio used for scaling/decode\r\n"
+    "  ODRIVE,LIMIT,<Nm>                      get/set the ODrive torque clamp\r\n"
     "  IMU,status                            IMX5 INS decode (bus 2, known-good reference device)\r\n";
 
 /* ── CAN,send raw injection ──────────────────────────────────────────────*/
@@ -311,6 +321,70 @@ static void handle_gim(const char *rest)
     }
 }
 
+/* ── ODRIVE (GDS68 / Steadywin GIM6010-8) ─────────────────────────────────*/
+static void handle_odrive(const char *rest)
+{
+    if (strcmp(rest, "LIST") == 0) {
+        uint8_t ids[ODRIVE_ID_MAX + 1];
+        int n = odrive_list_seen(ids, ODRIVE_ID_MAX + 1);
+        uint32_t now = (uint32_t)TIME_I2MS(chVTGetSystemTime());
+        chMtxLock(&s_usb_write_mtx);
+        for (int i = 0; i < n; i++) {
+            OdriveState st;
+            odrive_get_state(ids[i], st);
+            chprintf(STREAM, "ODRIVE,LIST,id=%u,axis_state=%u,axis_error=0x%08lx,age_ms=%lu\r\n",
+                     (unsigned)ids[i], (unsigned)st.axis_state, (uint32_t)st.axis_error,
+                     (uint32_t)(now - st.last_heartbeat_ms));
+        }
+        chprintf(STREAM, "ODRIVE,LIST,END\r\n");
+        chMtxUnlock(&s_usb_write_mtx);
+        return;
+    }
+    if (strncmp(rest, "GEAR,", 5) == 0) {
+        float v;
+        if (sscanf(rest + 5, "%f", &v) == 1) odrive_set_gear_ratio(v);
+        reply("ODRIVE,GEAR,%.4f\r\n", (double)odrive_get_gear_ratio());
+        return;
+    }
+    if (strncmp(rest, "LIMIT,", 6) == 0) {
+        float v;
+        if (sscanf(rest + 6, "%f", &v) == 1) odrive_set_torque_limit(v);
+        reply("ODRIVE,LIMIT,%.3f\r\n", (double)odrive_get_torque_limit());
+        return;
+    }
+
+    unsigned id;
+    int consumed = 0;
+    if (sscanf(rest, "%u%n", &id, &consumed) != 1 || id > ODRIVE_ID_MAX) {
+        reply("ODRIVE,ERR,bad_id\r\n");
+        return;
+    }
+    odrive_set_bus(s_active_bus);
+    const char *p = rest + consumed;
+    if (*p == ',') p++;
+
+    if (strcmp(p, "START") == 0) {
+        reply("ODRIVE,%u,START,%s\r\n", id, odrive_start((uint8_t)id) ? "OK" : "ERR");
+    } else if (strcmp(p, "IDLE") == 0 || strcmp(p, "STOP") == 0) {
+        reply("ODRIVE,%u,IDLE,%s\r\n", id, odrive_idle((uint8_t)id) ? "OK" : "ERR");
+    } else if (strncmp(p, "MODE,", 5) == 0) {
+        const char *m = p + 5;
+        bool known = (strcmp(m, "TORQUE") == 0) || (strcmp(m, "VELOCITY") == 0);
+        bool ok = known && odrive_set_mode((uint8_t)id, strcmp(m, "VELOCITY") == 0);
+        reply("ODRIVE,%u,MODE,%s\r\n", id, ok ? "OK" : "ERR");
+    } else if (strncmp(p, "TORQUE,", 7) == 0) {
+        float v;
+        bool ok = sscanf(p + 7, "%f", &v) == 1 && odrive_torque((uint8_t)id, v);
+        reply("ODRIVE,%u,TORQUE,%s\r\n", id, ok ? "OK" : "ERR");
+    } else if (strncmp(p, "VELOCITY,", 9) == 0) {
+        float v;
+        bool ok = sscanf(p + 9, "%f", &v) == 1 && odrive_velocity((uint8_t)id, v);
+        reply("ODRIVE,%u,VELOCITY,%s\r\n", id, ok ? "OK" : "ERR");
+    } else {
+        reply("ODRIVE,%u,ERR,unknown_cmd\r\n", id);
+    }
+}
+
 /* ── IMU (IMX5, bus 2 — known-good reference device) ─────────────────────*/
 static void print_imu_line(void)
 {
@@ -372,6 +446,16 @@ static void handle_status(void)
                 (uint32_t)(now - s.last_update_ms));
         }
     }
+    for (uint8_t id = 0; id <= ODRIVE_ID_MAX; id++) {
+        OdriveState s;
+        if (odrive_get_state(id, s) && s.valid) {
+            chprintf(STREAM,
+                "STATUS,ODRIVE,%u,pos=%.3f,vel=%.3f,axis_state=%u,axis_error=0x%08lx,age_ms=%lu\r\n",
+                (unsigned)id, (double)s.pos_rad, (double)s.vel_rads,
+                (unsigned)s.axis_state, (uint32_t)s.axis_error,
+                (uint32_t)(now - s.last_heartbeat_ms));
+        }
+    }
     chprintf(STREAM, "STATUS,END\r\n");
     chMtxUnlock(&s_usb_write_mtx);
 }
@@ -400,6 +484,7 @@ static void dispatch(const char *line)
     } else if (strcmp(line, "STOP,ALL") == 0) {
         rmd_stop_all();
         gim_stop_all();
+        odrive_stop_all();
         reply("STOP,ALL,OK\r\n");
     } else if (strncmp(line, "CAN,", 4) == 0) {
         handle_can(line + 4);
@@ -407,6 +492,8 @@ static void dispatch(const char *line)
         handle_rmd(line + 4);
     } else if (strncmp(line, "GIM,", 4) == 0) {
         handle_gim(line + 4);
+    } else if (strncmp(line, "ODRIVE,", 7) == 0) {
+        handle_odrive(line + 7);
     } else if (strncmp(line, "IMU,", 4) == 0) {
         handle_imu(line + 4);
     } else if (line[0] != '\0') {

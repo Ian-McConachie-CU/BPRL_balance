@@ -3,6 +3,7 @@
 #include "src/RobotState.hpp"
 #include "src/threads.hpp"        // IMURaw, CANIMURaw, MocapRaw
 #include "src/coms/CANMotor.hpp"  // CanMotorState (wheel-encoder velocity fusion)
+#include "src/kinematics/FiveBarIK.hpp"
 
 // Lowpass cutoff frequencies for derived derivative states (Hz)
 #define STATEMGR_LP_UVWDOT_HZ     50.0f   // cutoff for u_dot/v_dot/w_dot
@@ -12,9 +13,20 @@
 
 // Wheel-encoder velocity fusion (see StateManager::update, step 2.5) --
 // tune these once real wheels/encoders are on the bench.
-#define STATEMGR_WHEEL_RADIUS_M   0.070f  // must match wheeled_biped.m's p.R
+#define STATEMGR_WHEEL_RADIUS_M   0.092f  // must match wheeled_biped.m's p.R
 #define STATEMGR_WHEEL_L_SIGN     (+1.0f) // flip to -1 if wheel L's encoder
 #define STATEMGR_WHEEL_R_SIGN     (+1.0f) // reads backwards vs. wheel R's
+
+// Per-leg state from the most recent update_legs_and_wheels() call.
+// Exposed for RobotTelemetry (per-leg breakdown) -- see telemetry_plan.md
+// items F/G. NOT the same as StateIdx::LEG_* (those are both-legs-averaged
+// Kalman-adjacent outputs written into g_state by get_state()).
+struct LegState {
+    float L0, L0_dot;       // m, m/s
+    float thL, thL_dot;     // rad, rad/s -- hip-relative (see FiveBarIK.hpp)
+    float x_dot, z_dot;     // m/s, foot-point velocity rel. to body, NED convention
+    bool  valid;
+};
 
 /*
  * StateManager — multi-lane EKF orchestrator.
@@ -54,6 +66,15 @@ public:
     // brief slip. See StateManager::update() step 2.5.
     static constexpr float R_WHEEL_VEL = 2e-3f;
 
+    // Leg+wheel combined velocity fusion — looser than R_WHEEL_VEL since
+    // this stacks FK/Jacobian noise on top of the wheel encoder alone.
+    // R_LEG_WHEEL_W is deliberately loose: it's a soft pseudo-measurement
+    // (flat-ground-contact assumption), not direct sensing like the wheel
+    // encoder's rolling-velocity contribution to R_LEG_WHEEL_U. Placeholders
+    // — retune on the bench, same status as R_WHEEL_VEL originally was.
+    static constexpr float R_LEG_WHEEL_U = 5e-3f;
+    static constexpr float R_LEG_WHEEL_W = 2e-2f;
+
     StateManager();
 
     void init();
@@ -63,14 +84,22 @@ public:
     // imu: snapshot of g_imu[3] (taken under imu_mtx before this call).
     // can_imu: snapshot of g_can_imu (taken under can_imu_mtx before this call).
     // mocap: snapshot of g_mocap (taken under mocap_mtx before this call).
-    // wheels: snapshot of the two wheel motors' CAN state (ids 5, 6 — Wheel
-    //         L, Wheel R — via can_motor_get_state(), which is internally
-    //         mutex-protected, no separate lock needed by the caller).
     void update(float dt, const IMURaw imu[3], const CANIMURaw& can_imu,
-                const MocapRaw& mocap, const CanMotorState wheels[2]);
+                const MocapRaw& mocap);
 
-    // Full 19-element state output — maps 13-state EKF lanes onto StateIdx ordering
-    // and fills in the 6 derived quantities (uvw_dot, pqr_dot).
+    // Call once per StateEstThread tick, right after update() — computes
+    // per-leg FK from the 4 hip encoders, fuses the combined leg+wheel
+    // body-velocity pseudo-measurement into U and W on every valid lane
+    // (falling back to wheel-only U fusion if no leg is valid), and
+    // updates the averaged StateIdx::LEG_* values get_state() will write.
+    // hips: CanMotorState for ids 1-4 (FL/FR/RL/RR). wheels: ids 5,6 (L/R).
+    // Both via can_motor_get_state() — internally mutex-protected, no
+    // separate lock needed by the caller. See telemetry_plan.md item F.
+    void update_legs_and_wheels(const CanMotorState hips[4], const CanMotorState wheels[2]);
+
+    // Full StateIdx::N-element state output — maps the primary lane's EKF
+    // state onto StateIdx ordering, fills in the 6 derived quantities
+    // (uvw_dot, pqr_dot), and the 4 averaged leg states (19-22).
     void get_state(float out[StateIdx::N]) const;
 
     // Derived Euler angles (from primary lane quaternion).
@@ -82,6 +111,11 @@ public:
     void get_lane_euler(int lane, float& roll, float& pitch, float& yaw) const;
     void get_lane_pqr  (int lane, float& p,    float& q,    float& r)    const;
     int  primary_lane  () const { return _primary; }
+
+    // Per-leg (0=left, 1=right) FK snapshot from the most recent
+    // update_legs_and_wheels() call — for RobotTelemetry's per-leg
+    // breakdown (StateIdx::LEG_* is both-legs-averaged instead).
+    void get_leg_state(int leg, LegState& out) const;
 
 private:
     EKF  _lanes[NUM_LANES];
@@ -103,6 +137,15 @@ private:
 
     // Per-lane bias-corrected angular rates (updated each update() call)
     float _lane_p[NUM_LANES], _lane_q[NUM_LANES], _lane_r[NUM_LANES];
+
+    // Per-leg (0=left, 1=right) FK/velocity snapshot from
+    // update_legs_and_wheels() — see get_leg_state().
+    LegState _leg[2];
+
+    // Both-legs-averaged leg state, written into StateIdx::LEG_* by
+    // get_state() — theta = phi - thL (NED convention, see FiveBarIK.hpp).
+    float _leg_L_avg, _leg_L_dot_avg, _leg_theta_avg, _leg_theta_dot_avg;
+    bool  _leg_avg_valid;
 
     int  _select_primary() const;
 };

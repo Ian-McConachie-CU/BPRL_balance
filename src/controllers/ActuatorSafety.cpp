@@ -2,12 +2,6 @@
 #include "src/coms/CANMotor.hpp"
 #include "src/math/math.hpp"
 
-// Out-of-class definitions required pre-C++17 for constexpr array members
-// that are odr-used (indexed at runtime below) rather than just read as
-// compile-time constants.
-constexpr float ActuatorSafety::HIP_ANGLE_MIN_RAD[4];
-constexpr float ActuatorSafety::HIP_ANGLE_MAX_RAD[4];
-
 // CAN ids 1..6 = hip FL, FR, RL, RR, wheel L, wheel R (main.cpp's
 // can_motor_register order) — matches motor_torques[]'s own ordering.
 static constexpr uint8_t MOTOR_IDS[6] = {1, 2, 3, 4, 5, 6};
@@ -37,20 +31,14 @@ void ActuatorSafety::apply(float motor_torques[6]) const
             continue;
         }
 
+        // Hips: no limiting here -- CANMotor.cpp's hip safety gate already
+        // clamps whatever can_motor_set_torque() is about to be called with
+        // below, at the source, regardless of caller. See ActuatorSafety.hpp.
+        if (is_hip) continue;
+
         float t = motor_torques[i];
-
-        if (is_hip) {
-            const float angle_scale = limit_scale(ms.pos_rad, HIP_ANGLE_MIN_RAD[i], HIP_ANGLE_MAX_RAD[i],
-                                                   HIP_ANGLE_SOFT_MARGIN_RAD, t);
-            const float vel_scale   = limit_scale(ms.vel_rads, -HIP_VEL_LIMIT_RADS, HIP_VEL_LIMIT_RADS,
-                                                   HIP_VEL_SOFT_MARGIN_RADS, t);
-            t = constrain_float(t * angle_scale * vel_scale, -HIP_TORQUE_LIMIT_NM, HIP_TORQUE_LIMIT_NM);
-        } else {
-            const float vel_scale = limit_scale(ms.vel_rads, -WHEEL_VEL_LIMIT_RADS, WHEEL_VEL_LIMIT_RADS,
-                                                 WHEEL_VEL_SOFT_MARGIN_RADS, t);
-            t = constrain_float(t * vel_scale, -WHEEL_TORQUE_LIMIT_NM, WHEEL_TORQUE_LIMIT_NM);
-        }
-
-        motor_torques[i] = t;
+        const float vel_scale = limit_scale(ms.vel_rads, -WHEEL_VEL_LIMIT_RADS, WHEEL_VEL_LIMIT_RADS,
+                                             WHEEL_VEL_SOFT_MARGIN_RADS, t);
+        motor_torques[i] = constrain_float(t * vel_scale, -WHEEL_TORQUE_LIMIT_NM, WHEEL_TORQUE_LIMIT_NM);
     }
 }

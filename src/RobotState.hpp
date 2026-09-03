@@ -48,8 +48,20 @@ namespace StateIdx {
     constexpr int Q_DOT = 17;
     constexpr int R_DOT = 18;
 
-    // Total current state dimension (joint angles added in future EKF extension)
-    constexpr int N = 19;
+    // ── Leg state — both legs averaged, directly computed + lowpass
+    // filtered (NOT Kalman-fused, see EKF.hpp's header comment) via
+    // FiveBarIK + StateManager::update_legs_and_wheels(). Per-leg (not
+    // averaged) breakdown lives in RobotTelemetry instead — see
+    // telemetry_plan.md's Architecture section for why these live in two
+    // separate places. theta = phi - thL (NED sign convention, see
+    // src/kinematics/FiveBarIK.hpp).
+    constexpr int LEG_L         = 19;  // m,    virtual leg length
+    constexpr int LEG_L_DOT     = 20;  // m/s
+    constexpr int LEG_PITCH     = 21;  // rad,  theta = phi - thL
+    constexpr int LEG_PITCH_DOT = 22;  // rad/s
+
+    // Total current state dimension
+    constexpr int N = 23;
 }
 
 namespace InputIdx {

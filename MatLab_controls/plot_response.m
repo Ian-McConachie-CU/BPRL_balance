@@ -1,21 +1,30 @@
 function plot_response(controller)
 %PLOT_RESPONSE  Live, looping closed-loop simulation.
 %
-%  plot_response()        -- runs the LQR (default)
-%  plot_response('lqr')   -- gain-scheduled LQR (wb.simulate)
-%  plot_response('pid')   -- SLC PID cascade + hip lock (wb.simulatePid) --
-%                             edit the `gains` struct in section 1 below to
-%                             tune it; each field maps 1:1 to a constexpr in
-%                             src/controllers/PidBalanceController.hpp /
-%                             HipLock.hpp -- see wb.defaultPidGains's help.
+%  plot_response()          -- runs the LQR (default)
+%  plot_response('lqr')     -- gain-scheduled LQR (wb.simulate)
+%  plot_response('pid')     -- SLC PID cascade + hip lock (wb.simulatePid) --
+%                               edit the `gains` struct in section 1 below to
+%                               tune it; each field maps 1:1 to a constexpr in
+%                               src/controllers/PidBalanceController.hpp /
+%                               HipLock.hpp -- see wb.defaultPidGains's help.
+%  plot_response('collapse') -- VELOCITY-CONTROLLED-WHEEL scenario (wb.simulateVel,
+%                               discrete 100 Hz LQR, matches CANMotor.cpp's ODrive
+%                               velocity mode): starts fully collapsed and tipped
+%                               over 30 deg, balances through a height-setpoint leg
+%                               move, then tracks a square-wave velocity command --
+%                               same scenario as collapse_recovery_demo.m (the
+%                               headless/batch version), live-animated here instead.
+%                               Edit section 1's 'collapse' case to change the
+%                               angles/timing/amplitude.
 %
-%  Either controller balances the full nonlinear plant while tracking a
-%  sinusoidal forward-velocity target, with realistic sensor noise (and a
-%  small sensor/CAN/compute delay) injected between the TRUE plant state
-%  and what the controller actually acts on -- see wb.simulate's
-%  opts.noiseStd / opts.delay. Runs indefinitely, advancing in short
-%  chunks and redrawing live, until you close either figure window (or
-%  Ctrl+C).
+%  'lqr'/'pid' balance the full nonlinear plant while tracking a sinusoidal
+%  forward-velocity target; 'collapse' runs the scenario above. All three
+%  inject realistic sensor noise (and a small sensor/CAN/compute delay)
+%  between the TRUE plant state and what the controller actually acts on --
+%  see wb.simulate's/wb.simulateVel's opts.noiseStd / opts.delay. Runs
+%  indefinitely, advancing in short chunks and redrawing live, until you
+%  close either figure window (or Ctrl+C).
 %
 %  Note the phase lag between the velocity target and the actual velocity
 %  in the top plot -- that's real, not a bug: an LQR tuned to REGULATE
@@ -46,6 +55,11 @@ clc; close all;
 
 wb = wheeled_biped();
 p  = wb.params();
+
+velMode = strcmp(controller, 'collapse');   % velocity-controlled-wheel model
+                                             % (5-state, no x) vs the 6-state
+                                             % torque model 'lqr'/'pid' use --
+                                             % branched throughout below
 
 %% ---- 1. controller ----------------------------------------------------
 switch controller
@@ -91,24 +105,70 @@ case 'pid'
     % cascade's own behavior in isolation from that limit, or revisit
     % params() (m_b tripled without I_b changing -- see chat history) if a
     % lighter/more realistic body brings the open-loop pole back down.
+case 'collapse'
+    % Requested 2026-09-02 -- see collapse_recovery_demo.m for the headless/
+    % batch version of this same scenario (that file has the fuller write-up
+    % on the phi1/phi4 convention this depends on -- front CCW-positive,
+    % rear CW-positive, confirmed 2026-09-02). "-10 deg on both hips" is a
+    % genuinely TALLER stance than "+16 deg" (L=0.152m vs 0.098m), matching
+    % the height-setpoint framing below as intended.
+    PHI1_START_DEG  = 16;   PHI4_START_DEG  = 16;    % collapsed pose
+    PHI1_TARGET_DEG = -10;  PHI4_TARGET_DEG = -10;   % height setpoint
+    PHI0_DEG  = 30;    % initial body tip                              [deg]
+    T_HEIGHT  = 4.0;   % height-setpoint phase duration                [s]
+    TAU_L     = 1.0;   % leg-extension time constant (exp crossfade)   [s]
+    VEL_AMP   = 0.3;   % square-wave velocity amplitude                [m/s]
+    VEL_FREQ  = 0.1;   % square-wave frequency                        [Hz]
+    dtCk      = 1/100; % matches main.cpp's ControlThread rate
+
+    [L_START, thL_start] = wb.fk(p, deg2rad(PHI1_START_DEG),  deg2rad(PHI4_START_DEG));
+    [L_CMD,   ~]          = wb.fk(p, deg2rad(PHI1_TARGET_DEG), deg2rad(PHI4_TARGET_DEG));
+    fprintf('collapsed start : phi1=phi4=%+.0fdeg -> L0=%.4f m\n', PHI1_START_DEG, L_START);
+    fprintf('height setpoint : phi1=phi4=%+.0fdeg -> L0=%.4f m\n', PHI1_TARGET_DEG, L_CMD);
+
+    Qv = diag([40 2 800 8]);   % [theta, thetadot, phi, phidot] -- placeholder, see wheeled_biped.m
+    Rv = diag([1 3]);          % [ax, Tp]                         -- placeholder, see wheeled_biped.m
+    Lgrid = linspace(min(0.08, L_CMD*0.9), 0.34, 25);   % widened to cover L_CMD, not just [0.16,0.34]
+    sched = wb.schedule(p, Qv, Rv, Lgrid, 3, 'velwheel', dtCk);
+
+    phi0Coll   = deg2rad(PHI0_DEG);
+    theta0Coll = phi0Coll - thL_start;
 otherwise
-    error('plot_response:controller', 'controller must be ''lqr'' or ''pid''');
+    error('plot_response:controller', 'controller must be ''lqr'', ''pid'', or ''collapse''');
 end
 
 %% ---- 2. velocity target + sensor model -----------------------------------
-L    = 0.2;                             % leg length held constant this run
-fHz  = 0.1;                              % velocity-target frequency
-vAmp = 1.00;                             % velocity-target amplitude [m/s]
-vRef = @(tAbs) vAmp * sin(2*pi*fHz*tAbs);
+if velMode
+    % square-wave height-then-velocity scenario -- see section 1's
+    % 'collapse' case for the constants (T_HEIGHT, TAU_L, VEL_AMP, VEL_FREQ)
+    Lref = @(tAbs) L_CMD + (L_START - L_CMD) * exp(-max(tAbs,0) / TAU_L);
+    vRef = @(tAbs) (tAbs >= T_HEIGHT) .* VEL_AMP .* sign(sin(2*pi*VEL_FREQ*(tAbs - T_HEIGHT)));
+    uLim = [20, 40];   % [ax_max (m/s^2), Thip_max (N.m)] -- NOT torque, see linearModelVel's header
+    simOpts = struct();
+    simOpts.dt       = dtCk;
+    simOpts.noiseStd = [0.005, 0.005, 0.08, 0.05, 0.05];   % theta,phi,xdot,thetadot,phidot
+    simOpts.delay    = 0.00;
+    s0 = [theta0Coll; phi0Coll; 0; 0; 0];   % [theta;phi;xdot;thetadot;phidot], at rest
+    s0Init  = s0;    % saved so the whole scenario can restart from it -- see section 5's loopSec
+    loopSec = 10;     % restart the scenario (state AND reference-function phase) every this many
+                       % seconds of simulated time, so it repeats as a demo loop instead of
+                       % settling once and tracking the square wave forever
+else
+    L    = 0.2;                             % leg length held constant this run
+    fHz  = 0.1;                              % velocity-target frequency
+    vAmp = 1.00;                             % velocity-target amplitude [m/s]
+    vRef = @(tAbs) vAmp * sin(2*pi*fHz*tAbs);
 
-uLim = [2*p.tau_wheel_peak, 40];
+    uLim = [2*p.tau_wheel_peak, 40];
 
-simOpts = struct();
-simOpts.dt       = 1/400;
-% Rough IMU/encoder-class noise placeholders (see wb.simulate help) -- NOT
-% measured on real hardware, replace once it is:
-simOpts.noiseStd = [0.01, 0.005, 0.005, 0.08, 0.05, 0.05];
-simOpts.delay    = 0.00;                % 10 ms sensor/CAN/compute latency
+    simOpts = struct();
+    simOpts.dt       = 1/400;
+    % Rough IMU/encoder-class noise placeholders (see wb.simulate help) -- NOT
+    % measured on real hardware, replace once it is:
+    simOpts.noiseStd = [0.01, 0.005, 0.005, 0.08, 0.05, 0.05];
+    simOpts.delay    = 0.00;                % 10 ms sensor/CAN/compute latency
+    s0 = [0; 0; 0; 0; 0; 0];
+end
 
 %% ---- 3. figures: rolling time-series + live 2D animation -----------------
 histSec = 8;                             % rolling window shown in the time-series plot
@@ -119,8 +179,13 @@ axV = subplot(3,1,1); hold(axV, 'on'); grid(axV, 'on');
 hVref = plot(axV, nan, nan, 'Color', [0.6 0.6 0.6], 'LineWidth', 1.5, 'DisplayName', 'v_{ref}');
 hVact = plot(axV, nan, nan, 'Color', [0.1 0.4 0.8], 'LineWidth', 1.5, 'DisplayName', 'v_{actual}');
 ylabel(axV, 'xdot [m/s]'); legend(axV, 'Location', 'best');
-title(axV, sprintf('[%s] Tracking a %.1f Hz, %.2f m/s sinusoidal velocity target (note the phase lag -- see help)', ...
-    upper(controller), fHz, vAmp));
+if velMode
+    title(axV, sprintf('[%s] Collapsed start, %d deg tip-over, height setpoint then %.1f Hz square-wave velocity', ...
+        upper(controller), PHI0_DEG, VEL_FREQ));
+else
+    title(axV, sprintf('[%s] Tracking a %.1f Hz, %.2f m/s sinusoidal velocity target (note the phase lag -- see help)', ...
+        upper(controller), fHz, vAmp));
+end
 
 axAng = subplot(3,1,2); hold(axAng, 'on'); grid(axAng, 'on');
 hTh = plot(axAng, nan, nan, 'LineWidth', 1.5, 'DisplayName', '\theta (leg)');
@@ -128,9 +193,16 @@ hPh = plot(axAng, nan, nan, 'LineWidth', 1.5, 'DisplayName', '\phi (body)');
 ylabel(axAng, 'angle [deg]'); legend(axAng, 'Location', 'best');
 
 axU = subplot(3,1,3); hold(axU, 'on'); grid(axU, 'on');
-hUw = plot(axU, nan, nan, 'LineWidth', 1.5, 'DisplayName', 'T_{wheel}');
-hUp = plot(axU, nan, nan, 'LineWidth', 1.5, 'DisplayName', 'T_{hip}');
-ylabel(axU, 'torque [N.m]'); xlabel(axU, 'time [s]'); legend(axU, 'Location', 'best');
+if velMode
+    hUw = plot(axU, nan, nan, 'LineWidth', 1.5, 'DisplayName', 'a_x [m/s^2]');
+    hUp = plot(axU, nan, nan, 'LineWidth', 1.5, 'DisplayName', 'T_{hip} [N.m]');
+    ylabel(axU, 'u');
+else
+    hUw = plot(axU, nan, nan, 'LineWidth', 1.5, 'DisplayName', 'T_{wheel}');
+    hUp = plot(axU, nan, nan, 'LineWidth', 1.5, 'DisplayName', 'T_{hip}');
+    ylabel(axU, 'torque [N.m]');
+end
+xlabel(axU, 'time [s]'); legend(axU, 'Location', 'best');
 
 figAnim = figure('Name', 'Live view', 'Position', [1000 50 900 600]);
 axAnim  = axes('Parent', figAnim); hold(axAnim, 'on'); axis(axAnim, 'equal'); grid(axAnim, 'on');
@@ -173,9 +245,13 @@ follow = true;   % camera follows the robot horizontally; set false to keep it f
 % frameDt throttles redraws to ~30 fps regardless of the 400 Hz control
 % rate -- drawFrame is called once per control tick, but only actually
 % updates the plots/animation every frameDt seconds of SIMULATED time.
-histT = zeros(0,1); histS = zeros(0,6); histU = zeros(0,2);
+histT = zeros(0,1); histS = zeros(0,3); histU = zeros(0,2);   % [theta,phi,xdot] normalized
 lastDraw = -inf;
 frameDt  = 1/30;
+xAcc = 0;   % integrated wheel position, velMode only -- s has no x state
+            % there (see linearModelVel's header), so this is a LOCAL
+            % accumulator purely for animation/camera-following, not fed
+            % back into the dynamics or controller.
 
     function ok = drawFrame(tAbs, s, u)
         % Nested function: shares plot_response's workspace directly (all
@@ -185,13 +261,24 @@ frameDt  = 1/30;
         if ~ishandle(figTS) || ~ishandle(figAnim)
             return
         end
+
+        if velMode
+            thetaNow = s(1); phiNow = s(2); xdotNow = s(3);
+            xAcc  = xAcc + xdotNow * simOpts.dt;   % integrate every call, not just drawn frames
+            xNow  = xAcc;
+            Lnow  = Lref(tAbs);
+        else
+            xNow = s(1); thetaNow = s(2); phiNow = s(3); xdotNow = s(4);
+            Lnow = L;
+        end
+
         if (tAbs - lastDraw) < frameDt
             return
         end
         lastDraw = tAbs;
 
         histT(end+1,1) = tAbs;
-        histS(end+1,:) = s.';
+        histS(end+1,:) = [thetaNow, phiNow, xdotNow];
         histU(end+1,:) = u.';
         if numel(histT) > nHist
             histT(1)   = [];
@@ -200,9 +287,9 @@ frameDt  = 1/30;
         end
 
         set(hVref, 'XData', histT, 'YData', vRef(histT));
-        set(hVact, 'XData', histT, 'YData', histS(:,4));
-        set(hTh,   'XData', histT, 'YData', rad2deg(histS(:,2)));
-        set(hPh,   'XData', histT, 'YData', rad2deg(histS(:,3)));
+        set(hVact, 'XData', histT, 'YData', histS(:,3));
+        set(hTh,   'XData', histT, 'YData', rad2deg(histS(:,1)));
+        set(hPh,   'XData', histT, 'YData', rad2deg(histS(:,2)));
         set(hUw,   'XData', histT, 'YData', histU(:,1));
         set(hUp,   'XData', histT, 'YData', histU(:,2));
         if numel(histT) > 1
@@ -211,7 +298,7 @@ frameDt  = 1/30;
             xlim(axU,   [histT(1) histT(end)]);
         end
 
-        pts = wb.robotFrame(wb, p, L, s(2), s(3), s(1));
+        pts = wb.robotFrame(wb, p, Lnow, thetaNow, phiNow, xNow);
 
         set(wheelH, 'Position', [pts.wheelCenter(1)-p.R, pts.wheelCenter(2)-p.R, 2*p.R, 2*p.R]);
         set(spokeH, 'XData', [pts.spoke1(1), pts.spoke2(1)], ...
@@ -238,8 +325,8 @@ frameDt  = 1/30;
                    Omid + Lb*uax - (bodyW/2)*nax, Omid - (bodyW/2)*nax];
         set(bodyH, 'XData', corners(1,:), 'YData', corners(2,:));
 
-        set(titleH, 'String', sprintf('t = %6.2f s   v_{ref} = %+5.2f m/s   v = %+5.2f m/s   \\theta = %5.1f deg   \\phi = %5.1f deg', ...
-            tAbs, vRef(tAbs), s(4), rad2deg(s(2)), rad2deg(s(3))));
+        set(titleH, 'String', sprintf('t = %6.2f s   v_{ref} = %+5.2f m/s   v = %+5.2f m/s   \\theta = %5.1f deg   \\phi = %5.1f deg   L = %.3f m', ...
+            tAbs, vRef(tAbs), xdotNow, rad2deg(thetaNow), rad2deg(phiNow), Lnow));
 
         if follow
             xlim(axAnim, [pts.wheelCenter(1)-0.5, pts.wheelCenter(1)+0.5]);
@@ -252,8 +339,12 @@ frameDt  = 1/30;
 % both figures can be checked between chunks and the loop stops cleanly
 % when you close either one. The velocity-target phase stays continuous
 % across chunks because elapsed simulated time (tElapsed) is carried
-% forward into vRef/stepCallback, never reset.
-s0        = [0; 0; 0; 0; 0; 0];
+% forward into vRef/stepCallback -- EXCEPT for 'collapse', which restarts
+% the whole scenario (state s0 AND tElapsed, so the height-setpoint/
+% square-wave phase timing restarts too, not just the physical state)
+% every loopSec seconds, turning the one-shot recovery scenario into a
+% repeating demo loop -- see section 2's loopSec/s0Init.
+% s0 already set per-controller in section 2 (5-state for 'collapse', 6-state otherwise)
 tElapsed  = 0;
 chunkSec  = 1;
 
@@ -268,10 +359,27 @@ while ishandle(figTS) && ishandle(figAnim)
         [~, S] = wb.simulate(p, sched, L, s0, chunkSec, uLim, simOpts);
     case 'pid'
         [~, S] = wb.simulatePid(p, L, gains, s0, chunkSec, uLim, simOpts);
+    case 'collapse'
+        Lchunk = @(tRel) Lref(t0 + tRel);   % chunk-relative wrapper, matches simOpts.vRef's pattern
+        [~, S] = wb.simulateVel(p, sched, Lchunk, s0, chunkSec, uLim, simOpts);
     end
 
     s0       = S(end,:).';
     tElapsed = tElapsed + chunkSec;
+
+    if velMode && tElapsed >= loopSec
+        % Restart the scenario from scratch: physical state back to the
+        % collapsed/tipped initial condition, elapsed time back to 0 (so
+        % Lref/vRef re-run their own t=0..T_HEIGHT.. phase rather than
+        % just continuing the square wave from wherever it left off), and
+        % the animation's rolling history/camera accumulator cleared so
+        % there's no visual jump-cut artifact in the time-series plots.
+        s0       = s0Init;
+        tElapsed = 0;
+        histT = zeros(0,1); histS = zeros(0,3); histU = zeros(0,2);
+        lastDraw = -inf;
+        xAcc = 0;
+    end
 end
 fprintf('Animation window closed -- stopped after %.1f s simulated.\n', tElapsed);
 end

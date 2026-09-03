@@ -3,9 +3,9 @@
 #include <cstring>
 
 /*
- * FDCAN1/2 bit timing — 1 Mbit/s, PLL2Q = 80 MHz.
- * BRP=5, TSEG1=13, TSEG2=2 → 16 Tq/bit, 87.5% sample point.
- * NBTP: NSJW=0, NBRP=4, NTSEG1=12, NTSEG2=1.
+ * FDCAN1/2 bit timing. Bus 1 (motors) and bus 2 (IMX5 IMU + Matek power
+ * monitor) get SEPARATE configs as of 2026-09-02 -- see bus 1's comment
+ * below for why. Both derive from PLL2Q = 80 MHz.
  *
  * CCCR_DAR (Disable Automatic Retransmission): without this, an unacked
  * frame (e.g. a motor that never answers) gets retried by the FDCAN
@@ -13,10 +13,68 @@
  * the bus and racking up TEC until bus-off, discovered 2026-09-01 bringing
  * up the wheel motors. Every motor command here is already reissued every
  * control cycle, so a dropped frame is self-healing on the next tick; there
- * is no reason to let the hardware retry-storm a stale one instead.
+ * is no reason to let the hardware retry-storm a stale one instead. Applies
+ * to both buses -- bus 2's devices are read-only from this firmware's
+ * perspective (no commands sent), so DAR only matters here in that it keeps
+ * the same NBTP-independent behavior consistent across both.
  */
-static const CANConfig can_cfg = {
-    0x00040C01,          // NBTP
+
+/*
+ * Bus 1 (motors) — DROPPED to 500 kbit/s from 1 Mbit/s 2026-09-02 while
+ * chasing hip3/4's degraded CAN reply rate on real hardware (signal-
+ * integrity issue, still being isolated) -- a slower bit rate gives the
+ * receiver more timing margin against reflections/ringing from imperfect
+ * termination. BRP doubled (5->10), TSEG1/TSEG2 left exactly as-is, so the
+ * Tq/bit count (16) and sample point (87.5%) are UNCHANGED -- only the bit
+ * period itself doubles. Previous 1 Mbit/s value was 0x00040C01, if
+ * reverting.
+ *
+ * SJW (resync jump width) also DOUBLED (1->2 Tq) same day, purely a noise-
+ * tolerance move: SJW bounds how far the receiver can shift its bit-sample
+ * timing per edge to resync with the transmitter, so a larger SJW means
+ * more tolerance for jitter/phase-shift induced by reflections/noise on
+ * imperfect wiring, at the cost of needing a larger jump to still be wrong
+ * (a real edge-timing consideration, not the same axis as sample-point
+ * position). This is a LOCAL, receive-side-only parameter -- unlike bit
+ * rate, it does NOT need to match other nodes on the bus, so this change
+ * carries none of the "every node must agree" risk the 500 kbit/s drop
+ * did. Capped at min(NTSEG1, NTSEG2) = NTSEG2 = 2 here (already at that
+ * cap) -- can't be raised further without also raising NTSEG2.
+ *
+ * BRP=10, TSEG1=13, TSEG2=2, SJW=2 → 16 Tq/bit, 87.5% sample point.
+ * NBTP: NSJW=1, NBRP=9, NTSEG1=12, NTSEG2=1.
+ *
+ * IMPORTANT: every node on bus 1 must agree on the BIT RATE -- each RMD
+ * hip drive's own CAN baud setting (its GUI tool) and each ODrive's
+ * config.can.baud_rate must ALSO be changed to 500 kbit/s, or that node
+ * goes completely silent (not just degraded) instead of matching. SJW
+ * does not need to match (see above).
+ */
+static const CANConfig can_cfg_bus1 = {
+    0x02090C01,          // NBTP -- 500 kbit/s, SJW=2 Tq
+    0x00000000,          // DBTP
+    FDCAN_CCCR_DAR,       // CCCR
+    0x00000000,          // TEST
+    0x00000000,          // RXGFC: accept all in RxFIFO0
+};
+
+/*
+ * Bus 2 (IMX5 INS IMU + Matek CAN-L4-BM power monitor) — bit rate left at
+ * 1 Mbit/s, UNCHANGED. Neither device is part of the bus-1 hip/wheel
+ * wiring problem this session is chasing, and dropping their rate without
+ * also reconfiguring both devices independently (IMX5's own config tool,
+ * the Matek module's DroneCAN GUI tool) would silence bus 2 entirely
+ * rather than just degrade it -- not worth the risk for an unrelated bus.
+ *
+ * SJW doubled (1->2 Tq) same as bus 1, same day, for the same reason (more
+ * tolerance for noise/reflection-induced timing jitter) -- this one IS
+ * risk-free to apply here too since it's a local, receive-side-only
+ * parameter that doesn't need to match other nodes (see bus 1's comment).
+ *
+ * BRP=5, TSEG1=13, TSEG2=2, SJW=2 → 16 Tq/bit, 87.5% sample point.
+ */
+static const CANConfig can_cfg_bus2 = {
+    0x02040C01,          // NBTP -- 1 Mbit/s, SJW=2 Tq
     0x00000000,          // DBTP
     FDCAN_CCCR_DAR,       // CCCR
     0x00000000,          // TEST
@@ -134,16 +192,63 @@ bool can_send(CanBus bus, uint32_t sid, const uint8_t *data, uint8_t dlc,
     txf.DLC        = dlc;
     if (dlc > 8) dlc = 8;
     for (int i = 0; i < dlc; i++) txf.data8[i] = data[i];
-    return canTransmitTimeout(drv, CAN_ANY_MAILBOX, &txf,
-                              TIME_MS2I(timeout_ms)) == MSG_OK;
+    bool ok = canTransmitTimeout(drv, CAN_ANY_MAILBOX, &txf,
+                                 TIME_MS2I(timeout_ms)) == MSG_OK;
+    if (ok) s_diag[(int)bus].tx_ok++; else s_diag[(int)bus].tx_fail++;
+    return ok;
 }
 
-/* ── Bus-off detection/recovery ─────────────────────────────────────────── */
+bool can_send_rtr(CanBus bus, uint32_t sid, uint8_t dlc, uint32_t timeout_ms)
+{
+    CANDriver *drv = (bus == CAN_BUS_1) ? &CAND1 : &CAND2;
+    CANTxFrame txf = {};
+    txf.common.XTD = 0;
+    txf.common.RTR = 1;
+    txf.std.SID    = sid;
+    txf.DLC        = dlc;
+    bool ok = canTransmitTimeout(drv, CAN_ANY_MAILBOX, &txf,
+                                 TIME_MS2I(timeout_ms)) == MSG_OK;
+    if (ok) s_diag[(int)bus].tx_ok++; else s_diag[(int)bus].tx_fail++;
+    return ok;
+}
+
+/* ── Bus-off detection/recovery + error-counter diagnostics ─────────────── */
+
+// Rising-edge trackers for the two "was this already true last time we
+// looked" conditions below -- PSR.BO clears on its own once recovery
+// completes, and RXF0S.RF0L is the M_CAN core's own "a message was lost"
+// flag (cleared once a subsequent message is stored successfully); without
+// edge-detecting both, a condition that stays set across several
+// back-to-back polls (this runs every CANThread loop iteration) would
+// inflate the count far past "how many distinct events happened."
+static bool s_was_busoff[2]   = { false, false };
+static bool s_was_fifo_lost[2] = { false, false };
 
 void can_check_busoff(CanBus bus)
 {
+    int b = (int)bus;
     CANDriver *drv = (bus == CAN_BUS_1) ? &CAND1 : &CAND2;
-    if ((drv->fdcan->PSR & FDCAN_PSR_BO) != 0U) {
+    const uint32_t psr  = drv->fdcan->PSR;
+    const uint32_t ecr  = drv->fdcan->ECR;
+    const uint32_t rxf0 = drv->fdcan->RXF0S;
+
+    const bool is_busoff   = (psr & FDCAN_PSR_BO)      != 0U;
+    const bool fifo_lost   = (rxf0 & FDCAN_RXF0S_RF0L) != 0U;
+    const uint8_t tec = (uint8_t)((ecr & FDCAN_ECR_TEC_Msk) >> FDCAN_ECR_TEC_Pos);
+    const uint8_t rec = (uint8_t)((ecr & FDCAN_ECR_REC_Msk) >> FDCAN_ECR_REC_Pos);
+
+    s_diag[b].tec = tec;
+    s_diag[b].rec = rec;
+    if (tec > s_diag[b].tec_peak) s_diag[b].tec_peak = tec;
+    if (rec > s_diag[b].rec_peak) s_diag[b].rec_peak = rec;
+
+    if (is_busoff && !s_was_busoff[b]) s_diag[b].busoff_count++;
+    s_was_busoff[b] = is_busoff;
+
+    if (fifo_lost && !s_was_fifo_lost[b]) s_diag[b].rx_fifo_lost++;
+    s_was_fifo_lost[b] = fifo_lost;
+
+    if (is_busoff) {
         drv->fdcan->CCCR &= ~FDCAN_CCCR_INIT;
     }
 }
@@ -158,6 +263,14 @@ void can_get_diag(CanBus bus, CANDiag &out)
     out.last_eff   = s_diag[b].last_eff;
     out.last_dlc   = s_diag[b].last_dlc;
     for (int i = 0; i < 8; i++) out.last_data[i] = s_diag[b].last_data[i];
+    out.tx_ok      = s_diag[b].tx_ok;
+    out.tx_fail    = s_diag[b].tx_fail;
+    out.tec          = s_diag[b].tec;
+    out.rec          = s_diag[b].rec;
+    out.tec_peak     = s_diag[b].tec_peak;
+    out.rec_peak     = s_diag[b].rec_peak;
+    out.busoff_count = s_diag[b].busoff_count;
+    out.rx_fifo_lost = s_diag[b].rx_fifo_lost;
 }
 
 /* ── IMX5 INS IMU callbacks (bus 2) ─────────────────────────────────────── */
@@ -232,8 +345,8 @@ int can_read_regs(CANRegEntry *out, int max)
 
 void can_drv_init(void)
 {
-    canStart(&CAND1, &can_cfg);
-    canStart(&CAND2, &can_cfg);
+    canStart(&CAND1, &can_cfg_bus1);
+    canStart(&CAND2, &can_cfg_bus2);
 
     // IMX5 INS IMU on bus 2 (standard 11-bit IDs 0x01–0x04)
     bprl_can_register(CAN_BUS_2, 0x01, imx5_can_cb, nullptr);

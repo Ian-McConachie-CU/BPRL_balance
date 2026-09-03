@@ -56,13 +56,14 @@ struct LogRates {
 };
 
 struct ThreadRates {
-    sysinterval_t spi;       // SPIThread        1 kHz
-    sysinterval_t est;       // StateEstThread   500 Hz
-    sysinterval_t control;   // ControlThread    400 Hz
-    sysinterval_t radio;     // RadioThread      100 Hz
-    sysinterval_t heartbeat; // HeartbeatThread  5 Hz
-    sysinterval_t debug;     // DebugThread      10 Hz (BPRL_DEBUG only)
-    LogRates       log;      // LogThread        50 Hz
+    sysinterval_t spi;        // SPIThread        1 kHz
+    sysinterval_t est;        // StateEstThread   500 Hz
+    sysinterval_t control;    // ControlThread    200 Hz (hips + compute)
+    sysinterval_t wheel_send; // WheelSendThread  300 Hz (wheels only, see threads.cpp)
+    sysinterval_t radio;      // RadioThread      100 Hz
+    sysinterval_t heartbeat;  // HeartbeatThread  5 Hz
+    sysinterval_t debug;      // DebugThread      10 Hz (BPRL_DEBUG only)
+    LogRates       log;       // LogThread        50 Hz
 };
 
 /* ── Thread entry points ─────────────────────────────────────────────────── */

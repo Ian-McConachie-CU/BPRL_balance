@@ -2,7 +2,11 @@
 #include "hal.h"
 
 /*
- * CAN bus driver — FDCAN1 (bus 1) and FDCAN2 (bus 2), both at 1 Mbit/s.
+ * CAN bus driver — FDCAN1 (bus 1, motors) and FDCAN2 (bus 2, IMX5+Matek).
+ * Bus 1 runs at 500 kbit/s (dropped from 1 Mbit/s 2026-09-02, see CAN.cpp's
+ * can_cfg_bus1 comment); bus 2 is unchanged at 1 Mbit/s. Every node on bus 1
+ * (each RMD hip drive, each ODrive) must be reconfigured to match 500 kbit/s
+ * too, or it goes silent rather than degraded.
  *
  * Bus assignment:
  *   CAN_BUS_1 (FDCAN1) — 6 CAN motors: RMD hip × 4 (IDs 1–4), ODrive wheel × 2 (IDs 5–6)
@@ -30,6 +34,27 @@ struct CANDiag {
     uint8_t  last_eff;
     uint8_t  last_dlc;
     uint8_t  last_data[8];
+    uint32_t tx_ok;        // can_send()/can_send_rtr() calls that returned true
+    uint32_t tx_fail;      // ...that returned false (canTransmitTimeout() != MSG_OK,
+                            // e.g. no free mailbox within timeout_ms) -- nonzero here
+                            // means the STM32 itself isn't getting frames onto the
+                            // wire, as distinct from a frame going out cleanly but
+                            // getting no reply.
+    // Hardware error-counter diagnostics -- quantify bus-level noise/errors
+    // directly (bit/stuff/form errors, missing ACKs: anything that
+    // increments the M_CAN core's own TEC/REC), independent of and
+    // complementary to tx_ok/tx_fail/rx_count above and in CANMotor.cpp --
+    // those can only tell you a given motor's commands/replies aren't
+    // getting through; these tell you whether the BUS ITSELF is seeing
+    // errors, which is what actually answers "is this bus noisy" rather
+    // than "is this one motor responding." Sampled every can_check_busoff()
+    // call (CANThread, every loop iteration) -- see CAN.cpp.
+    uint8_t  tec;          // current Transmit Error Counter (ECR.TEC, 0-255; 128+ = error-passive)
+    uint8_t  rec;          // current Receive Error Counter (ECR.REC, 0-127)
+    uint8_t  tec_peak;     // highest TEC observed since boot
+    uint8_t  rec_peak;     // highest REC observed since boot
+    uint32_t busoff_count; // number of times PSR.BO was observed set and recovery re-triggered
+    uint32_t rx_fifo_lost; // number of times RXF0S.RF0L (FIFO0 message lost) was newly observed set
 };
 
 // Register a handler for an 11-bit standard CAN ID (exact SID match).
@@ -57,6 +82,14 @@ void can_check_busoff(CanBus bus);
 // Send a frame on the given bus (blocks up to timeout_ms milliseconds).
 bool can_send(CanBus bus, uint32_t sid, const uint8_t *data, uint8_t dlc,
               uint32_t timeout_ms = 5);
+
+// Send a remote-transmission-request (RTR) frame -- no data payload, just
+// asks whatever device owns `sid` to reply with its data frame immediately.
+// Used to actively poll ODrive's Get_Encoder_Estimates instead of waiting
+// on its own periodic broadcast -- see CANMotor.cpp. `dlc` communicates the
+// expected reply length per convention; an RTR frame carries no data bytes
+// on the wire regardless of its value.
+bool can_send_rtr(CanBus bus, uint32_t sid, uint8_t dlc, uint32_t timeout_ms = 5);
 
 // Copy out current diagnostic counters for a bus (safe to call from any thread).
 void can_get_diag(CanBus bus, CANDiag &out);

@@ -69,6 +69,22 @@ def build_telemetry_panel(s: TelState) -> Panel:
                  f"Pitch: {s.rc_pitch:+5.3f}")
     grid.add_row("", "", f"Yaw:   {s.rc_yaw:+5.3f}")
 
+    est_grid = Table.grid(padding=(0, 2))
+    est_grid.add_column(min_width=20)
+    est_grid.add_column(min_width=20)
+    est_grid.add_column(min_width=20)
+    est_grid.add_row("[bold]LEG STATE (avg)[/bold]",
+                      "[bold]WHEEL VEL (rad/s)[/bold]",
+                      "[bold]BODY VEL (m/s)[/bold]")
+    est_grid.add_row(f"Height (L): {s.leg_L:+6.3f} m",
+                      f"L: {s.wheel_vel[0]:+8.3f}",
+                      f"U (fwd): {s.body_u:+7.3f}")
+    est_grid.add_row(f"L_dot:      {s.leg_L_dot:+6.3f} m/s",
+                      f"R: {s.wheel_vel[1]:+8.3f}",
+                      f"W (vert): {s.body_w:+7.3f}")
+    est_grid.add_row(f"Angle:      {s.leg_pitch:+6.2f}°", "", "")
+    est_grid.add_row(f"Angle_dot:  {s.leg_pitch_dot:+6.4f} rad/s", "", "")
+
     imu_grid = Table.grid(padding=(0, 2))
     imu_grid.add_column(min_width=20)
     imu_grid.add_column()
@@ -94,6 +110,7 @@ def build_telemetry_panel(s: TelState) -> Panel:
 
     body = Table.grid()
     body.add_row(grid)
+    body.add_row(Panel(est_grid, title="State Estimate", border_style="dim"))
     body.add_row(Panel(imu_grid, title="IMU Status", border_style="dim"))
     return Panel(body, title=title, border_style="blue")
 
@@ -159,9 +176,22 @@ def build_ekf_panel(s: EkfLaneState) -> Panel:
     _row("q", s.q, "+9.4f")
     _row("r", s.r, "+9.4f")
 
+    imu_grid = Table.grid(padding=(0, 2))
+    imu_grid.add_column(min_width=20)
+    imu_grid.add_column()
+    for i, lbl in enumerate(IMU_LABELS):
+        imu_grid.add_row(f"  IMU{i} {lbl}:", _valid(s.imu_valid[i]))
+    can_line = Text()
+    can_line.append(_valid(s.can_valid))
+    imu_grid.add_row("  CAN INS (IMX5):    ", can_line)
+
     diag  = f"  [dim]lines_rx={s.lines_rx}[/dim]"
     title = f"BPRL_Balance EKF Lanes    t={t_sec:8.1f} s{stale_note}{diag}"
-    return Panel(tbl, title=title, border_style="cyan")
+
+    body = Table.grid()
+    body.add_row(tbl)
+    body.add_row(Panel(imu_grid, title="Source IMU Status", border_style="dim"))
+    return Panel(body, title=title, border_style="cyan")
 
 
 def cmd_ekf_status(ser, _args):

@@ -1,4 +1,5 @@
 #include "StateManager.hpp"
+#include "src/kinematics/LegParams.hpp"
 #include "src/math/math.hpp"
 #include <cfloat>
 
@@ -11,6 +12,37 @@ static constexpr int iQ0=6, iQ1=7, iQ2=8, iQ3=9;
 static constexpr int iBax=10, iBay=11, iBaz=12;
 static constexpr int iBgx=13, iBgy=14, iBgz=15;
 
+/* ── Leg geometry / hip wiring — see telemetry_plan.md item F ────────────
+ * LEG_PARAMS (l1-l5) now lives in src/kinematics/LegParams.hpp -- shared
+ * with HipLock's dynamic-target leg-height hold and the StandUp/Lqr
+ * balance controllers, single source of truth instead of a file-local
+ * duplicate. Keep that header in sync with
+ * MatLab_controls/wheeled_biped.m's params() if the linkage is ever
+ * remeasured.
+ * Hip-to-leg pairing: main.cpp's motor map (ID1=Hip FL, ID2=Hip FR,
+ * ID3=Hip RL, ID4=Hip RR) directly gives left=FL/RL, right=FR/RR; phi1 is
+ * the REAR thigh (drives AB), phi4 is the FRONT thigh (drives ED) in
+ * FiveBarIK's convention — high confidence from naming, not yet physically
+ * confirmed (see telemetry_plan.md's Open Items — a phi1/phi4 mixup
+ * specifically mirrors thL's sign since l1==l4 and l2==l3 numerically).
+ * phi1/phi4 are ALSO opposite-sense conventions (phi1 CW-positive, phi4
+ * CCW-positive, confirmed 2026-09-02 — real front/rear hip actuators are
+ * mirror-mounted) — see FiveBarIK.hpp's header comment. hips[phi4_id].pos_rad
+ * below is fed straight into fk()/ik() as-is; CANMotor.cpp's HIP_SIGN only
+ * corrects LEFT/RIGHT mirroring, not this front/rear asymmetry, so this
+ * relies on the front hip's raw robot-frame encoder angle already reading
+ * CCW-positive after that correction — bench-verify alongside the pairing
+ * above before trusting FK-derived leg state for anything control-facing. */
+struct LegHipMap { uint8_t phi1_id, phi4_id; };   // 1-indexed CAN ids
+static constexpr LegHipMap LEG_HIP_MAP[2] = {
+    /* left  */ { /*phi1=*/3, /*phi4=*/1 },   // RL, FL
+    /* right */ { /*phi1=*/4, /*phi4=*/2 },   // RR, FR
+};
+// Hip encoder zero-offsets are applied centrally in CANMotor.cpp's
+// rmd_rx_cb() (HIP_OFFSET_RAD) -- hips[i].pos_rad below is ALREADY the
+// robot-frame angle, no offset needed here. See CANMotor.hpp's header
+// comment for the calibration workflow.
+
 /* ══════════════════════════════════════════════════════════════════════════
  * Construction / initialisation
  * ══════════════════════════════════════════════════════════════════════════ */
@@ -22,7 +54,10 @@ StateManager::StateManager()
       _prev_p(0.0f), _prev_q(0.0f), _prev_r(0.0f),
       _pdot_filt(0.0f), _qdot_filt(0.0f), _rdot_filt(0.0f),
       _ud_filt(0.0f), _vd_filt(0.0f), _wd_filt(0.0f),
-      _lane_p{}, _lane_q{}, _lane_r{}
+      _lane_p{}, _lane_q{}, _lane_r{},
+      _leg{},
+      _leg_L_avg(0.0f), _leg_L_dot_avg(0.0f), _leg_theta_avg(0.0f), _leg_theta_dot_avg(0.0f),
+      _leg_avg_valid(false)
 {}
 
 void StateManager::init()
@@ -40,6 +75,11 @@ void StateManager::init()
     for (int i = 0; i < NUM_LANES; ++i)
         _lane_p[i] = _lane_q[i] = _lane_r[i] = 0.0f;
 
+    _leg[0] = LegState{};
+    _leg[1] = LegState{};
+    _leg_L_avg = _leg_L_dot_avg = _leg_theta_avg = _leg_theta_dot_avg = 0.0f;
+    _leg_avg_valid = false;
+
     _initialized = true;
 }
 
@@ -48,7 +88,7 @@ void StateManager::init()
  * ══════════════════════════════════════════════════════════════════════════ */
 
 void StateManager::update(float dt, const IMURaw imu[3], const CANIMURaw& can_imu,
-                           const MocapRaw& mocap, const CanMotorState wheels[2])
+                           const MocapRaw& mocap)
 {
     if (!_initialized) return;
 
@@ -70,24 +110,6 @@ void StateManager::update(float dt, const IMURaw imu[3], const CANIMURaw& can_im
         Quat q_meas = { can_imu.q0, can_imu.q1, can_imu.q2, can_imu.q3 };
         for (int i = 0; i < NUM_LANES; ++i)
             _lanes[i].update_quaternion(q_meas, R_QUAT);
-    }
-
-    // ── 2.5. Wheel-encoder forward-velocity fusion (all lanes) ────────────
-    // Primary velocity source: wheel radius x angular rate, assuming the
-    // wheel is in contact with the ground (no slip detection/rejection --
-    // see STATEMGR_WHEEL_* and R_WHEEL_VEL comments). Between updates (and
-    // during any brief slip), EKF::predict()'s accel integration is what
-    // fills in / corrects the estimate.
-    if (wheels[0].valid || wheels[1].valid) {
-        float u_sum = 0.0f;
-        int   u_n   = 0;
-        if (wheels[0].valid) { u_sum += STATEMGR_WHEEL_L_SIGN * wheels[0].vel_rads * STATEMGR_WHEEL_RADIUS_M; u_n++; }
-        if (wheels[1].valid) { u_sum += STATEMGR_WHEEL_R_SIGN * wheels[1].vel_rads * STATEMGR_WHEEL_RADIUS_M; u_n++; }
-        const float u_wheel = u_sum / (float)u_n;
-        for (int i = 0; i < NUM_LANES; ++i) {
-            if (!_lanes[i].is_valid()) continue;
-            _lanes[i].update_wheel_velocity(u_wheel, R_WHEEL_VEL);
-        }
     }
 
     // ── 3. Select primary lane ────────────────────────────────────────────
@@ -200,6 +222,114 @@ void StateManager::update(float dt, const IMURaw imu[3], const CANIMURaw& can_im
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
+ * Leg FK + combined leg/wheel velocity fusion — call once per tick, right
+ * after update() (see telemetry_plan.md item F for the full derivation).
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+void StateManager::update_legs_and_wheels(const CanMotorState hips[4], const CanMotorState wheels[2])
+{
+    bool  leg_ok[2] = { false, false };
+    float leg_x[2] = {}, leg_z[2] = {}, leg_xdot[2] = {}, leg_zdot[2] = {};
+
+    float L_sum = 0.0f, Ldot_sum = 0.0f, theta_sum = 0.0f, thetadot_sum = 0.0f;
+    int   leg_n = 0;
+
+    const float phi = pitch();   // current body pitch — update() has already run this tick
+
+    for (int leg = 0; leg < 2; ++leg) {
+        const LegHipMap& m = LEG_HIP_MAP[leg];
+        const CanMotorState& h1 = hips[m.phi1_id - 1];
+        const CanMotorState& h4 = hips[m.phi4_id - 1];
+
+        if (!h1.valid || !h4.valid) { _leg[leg] = LegState{}; continue; }
+
+        const float phi1 = h1.pos_rad;
+        const float phi4 = h4.pos_rad;
+
+        FiveBarPose pose;
+        if (!fk(LEG_PARAMS, phi1, phi4, pose)) { _leg[leg] = LegState{}; continue; }
+
+        const FiveBarJac J    = jac(LEG_PARAMS, phi1, phi4);
+        const FiveBarVel vel  = jac_to_vel(J, h1.vel_rads, h4.vel_rads);
+        const FootPointNed ft = foot_point_ned(pose, vel);
+
+        _leg[leg].L0      = pose.L0;
+        _leg[leg].L0_dot  = vel.L0_dot;
+        _leg[leg].thL     = pose.thL;
+        _leg[leg].thL_dot = vel.thL_dot;
+        _leg[leg].x_dot   = ft.x_dot;
+        _leg[leg].z_dot   = ft.z_dot;
+        _leg[leg].valid   = true;
+
+        leg_x[leg] = ft.x; leg_z[leg] = ft.z;
+        leg_xdot[leg] = ft.x_dot; leg_zdot[leg] = ft.z_dot;
+        leg_ok[leg] = true;
+
+        L_sum        += pose.L0;
+        Ldot_sum     += vel.L0_dot;
+        theta_sum    += (phi - pose.thL);           // theta = phi - thL, see FiveBarIK.hpp
+        thetadot_sum += (_blended_q - vel.thL_dot);  // phi_dot ~= Q for this application, per controls_plan.md §1
+        leg_n++;
+    }
+
+    if (leg_n > 0) {
+        _leg_L_avg         = L_sum / (float)leg_n;
+        _leg_L_dot_avg     = Ldot_sum / (float)leg_n;
+        _leg_theta_avg     = theta_sum / (float)leg_n;
+        _leg_theta_dot_avg = thetadot_sum / (float)leg_n;
+        _leg_avg_valid     = true;
+    } else {
+        _leg_avg_valid = false;
+    }
+
+    // Combined leg+wheel body-velocity fusion (rigid-body kinematics of the
+    // wheel-axle/foot point, ground-contact + no-slip assumed):
+    //   U_meas = u_roll - Q*z_C - x_C_dot
+    //   W_meas = Q*x_C - z_C_dot
+    // See telemetry_plan.md item F for the derivation.
+    const float Q = _blended_q;
+
+    float u_sum = 0.0f, w_sum = 0.0f;
+    int   n     = 0;
+    for (int leg = 0; leg < 2; ++leg) {
+        if (!leg_ok[leg] || !wheels[leg].valid) continue;
+        const float sign   = (leg == 0) ? STATEMGR_WHEEL_L_SIGN : STATEMGR_WHEEL_R_SIGN;
+        const float u_roll = sign * wheels[leg].vel_rads * STATEMGR_WHEEL_RADIUS_M;
+        u_sum += u_roll - Q*leg_z[leg] - leg_xdot[leg];
+        w_sum +=          Q*leg_x[leg] - leg_zdot[leg];
+        n++;
+    }
+
+    if (n > 0) {
+        const float u_meas = u_sum / (float)n;
+        const float w_meas = w_sum / (float)n;
+        for (int i = 0; i < NUM_LANES; ++i) {
+            if (!_lanes[i].is_valid()) continue;
+            _lanes[i].update_leg_wheel_velocity(u_meas, w_meas, R_LEG_WHEEL_U, R_LEG_WHEEL_W);
+        }
+    } else if (wheels[0].valid || wheels[1].valid) {
+        // Graceful degradation: no leg's FK is valid but a wheel is --
+        // fall back to wheel-only U fusion (same math the old step-2.5
+        // fusion had) rather than lose velocity fusion entirely.
+        float u_sum2 = 0.0f;
+        int   n2     = 0;
+        if (wheels[0].valid) { u_sum2 += STATEMGR_WHEEL_L_SIGN * wheels[0].vel_rads * STATEMGR_WHEEL_RADIUS_M; n2++; }
+        if (wheels[1].valid) { u_sum2 += STATEMGR_WHEEL_R_SIGN * wheels[1].vel_rads * STATEMGR_WHEEL_RADIUS_M; n2++; }
+        const float u_wheel = u_sum2 / (float)n2;
+        for (int i = 0; i < NUM_LANES; ++i) {
+            if (!_lanes[i].is_valid()) continue;
+            _lanes[i].update_wheel_velocity(u_wheel, R_WHEEL_VEL);
+        }
+    }
+}
+
+void StateManager::get_leg_state(int leg, LegState& out) const
+{
+    if (leg < 0 || leg > 1) { out = LegState{}; return; }
+    out = _leg[leg];
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
  * Lane selection
  * ══════════════════════════════════════════════════════════════════════════ */
 
@@ -220,13 +350,13 @@ int StateManager::_select_primary() const
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
- * Full 19-element state output
+ * Full StateIdx::N-element state output
  * Maps 16-state EKF lanes onto the StateIdx ordering and inserts derived states.
  * ══════════════════════════════════════════════════════════════════════════ */
 
 void StateManager::get_state(float out[StateIdx::N]) const
 {
-    static_assert(StateIdx::N == 19, "state size mismatch");
+    static_assert(StateIdx::N == 23, "state size mismatch");
 
     const float* ekf = _lanes[_primary].state();  // EKF::N = 16 elements
 
@@ -260,6 +390,13 @@ void StateManager::get_state(float out[StateIdx::N]) const
     out[StateIdx::P_DOT] = _pdot_filt;
     out[StateIdx::Q_DOT] = _qdot_filt;
     out[StateIdx::R_DOT] = _rdot_filt;
+
+    // Leg state (both legs averaged, from update_legs_and_wheels()) → out[19-22].
+    // Zeroed (not left stale) when no leg's FK is currently valid.
+    out[StateIdx::LEG_L]         = _leg_avg_valid ? _leg_L_avg         : 0.0f;
+    out[StateIdx::LEG_L_DOT]     = _leg_avg_valid ? _leg_L_dot_avg     : 0.0f;
+    out[StateIdx::LEG_PITCH]     = _leg_avg_valid ? _leg_theta_avg     : 0.0f;
+    out[StateIdx::LEG_PITCH_DOT] = _leg_avg_valid ? _leg_theta_dot_avg : 0.0f;
 }
 
 /* ══════════════════════════════════════════════════════════════════════════

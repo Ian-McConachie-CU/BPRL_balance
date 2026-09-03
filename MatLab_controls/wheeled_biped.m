@@ -11,6 +11,21 @@ function wb = wheeled_biped()
 %   K              = wb.evalGains(sched, 0.25);
 %   wb.selfcheck();
 %
+%   REAL HARDWARE'S ACTUAL ACTUATION (2026-09-02): the wheel motor
+%   (GIM6010-8, see CANMotor.cpp) runs in ODrive VELOCITY mode, not torque
+%   mode; hips (LKMTECH MG8016E-i6) stay torque-controlled. The gain table
+%   the firmware should actually use comes from the VELOCITY-controlled,
+%   DISCRETE-time (100 Hz, matching main.cpp's ControlThread rate) design:
+%       sched = wb.schedule(p, Qv, Rv, linspace(0.16,0.34,25), 3, ...
+%                            'velwheel', 1/100);
+%       K     = wb.evalGains(sched, 0.25);   % rows [ax,Tp], cols
+%                                             % [theta,thetadot,phi,phidot]
+%   -- see linearModelVel()'s header for the ax-not-torque input and
+%   scheduleGains()'s header for the dt/'velwheel' arguments. The original
+%   '6state' torque-wheel design above still exists (used by simulate()/
+%   simulatePid()) for comparison and because it's what PidBalanceController
+%   was verified against -- see that class's header.
+%
 %   HOW THE DYNAMICS ARE SOURCED (read this once):
 %   The equations of motion, and the 5-bar Jacobian, are NOT hand-
 %   transcribed anywhere in this file. getSymbolicModel() builds everything
@@ -65,7 +80,12 @@ function wb = wheeled_biped()
 %   place instead of leaking a conversion layer through the whole file: the
 %   5-bar's own body-relative geometry (fk/ik/jac) is UNAFFECTED by any of
 %   this (phi1/phi4 are joint angles inside the leg's own local frame,
-%   independent of which way the world calls "positive pitch"); only the
+%   independent of which way the world calls "positive pitch") -- EXCEPT
+%   that phi1 (rear thigh) and phi4 (front thigh) are themselves opposite-
+%   sense conventions (phi1 CW-positive, phi4 CCW-positive), matching the
+%   real hardware's mirror-mounted front/rear hip actuators -- see fk()'s
+%   own header comment for the derivation, not a separate coordinate frame
+%   issue. Only the
 %   KE/PE position formulas and the generalized-force sign for T/Tp inside
 %   getSymbolicModel differ from the old +x-forward/+y-up/tilt-forward-
 %   positive derivation convenience -- see the comment at that substitution
@@ -94,14 +114,20 @@ wb.jointTorques  = @jointTorques;
 wb.taskStiffness = @taskStiffness;
 wb.massMatrix    = @massMatrix;
 wb.linearModel   = @linearModel;
+wb.linearModelVel = @linearModelVel;
 wb.rigidLegModel = @rigidLegModel;
 wb.nlDynamics    = @nlDynamics;
+wb.nlDynamicsVel = @nlDynamicsVel;
 wb.care          = @careSchur;
 wb.lqr           = @lqrGain;
+wb.dare          = @dareIter;
+wb.dlqr          = @dlqrGain;
+wb.discretize    = @discretize;
 wb.schedule      = @scheduleGains;
 wb.evalGains     = @evalGains;
 wb.workspace     = @workspaceReport;
 wb.simulate      = @simulate;
+wb.simulateVel   = @simulateVel;
 wb.simulatePid   = @simulatePid;
 wb.defaultPidGains = @defaultPidGains;
 wb.robotFrame    = @robotFrame;
@@ -116,18 +142,51 @@ end
 function p = params()
 %PARAMS  Default parameter struct. Replace every one of these with your
 %        measured / CAD values before trusting any gain it produces.
+%
+%   MEASURED 2026-09-02 (CAD/scale): thigh (l1==l4) 210 g / 0.00055 kg.m^2
+%   each, shin (l2==l3) 270 g / 0.002 kg.m^2 each, body 9.90 kg /
+%   0.08 kg.m^2, wheel 400 g / 0.0022 kg.m^2 each (R=92mm), wheel-drive
+%   motor (GIM6010-8, direct-drive hub, coincident with the wheel/axle
+%   point C) 350 g each, modeled as a uniform solid cylinder r=40mm about
+%   its own spin axis -- I = 0.5*m*r^2 = 0.00028 kg.m^2 each. That spin
+%   axis IS the pitch axis (same axis the wheel itself spins about), so
+%   unlike the leg links, the motor's mounting angle does not change its
+%   contribution here -- a cylinder's inertia about its own symmetry axis
+%   is invariant to rotation about that same axis. It's lumped directly
+%   into m_w/I_w below (mass + spin inertia, moving/rotating with the
+%   wheel), not modeled as a separate body.
 
 % --- masses and inertias, WHOLE ROBOT (both sides lumped into one sagittal model)
-p.m_w = .8;        % both wheels + rotating parts                    [kg]
-p.I_w = 0.004;     % both wheels about the axle, ~ m_w*R^2/2         [kg m^2]
-p.m_l = 0.53;        % both legs (linkage) total                       [kg]
-p.I_l = 0.002;      % legs about their own COM                        [kg m^2]
+p.m_w = 2*(0.400 + 0.350);        % both wheels (400g ea) + both wheel-drive
+                                   % motors (350g ea, direct-drive hub at the
+                                   % axle -- see note above)             [kg]
+p.I_w = 2*(0.0022 + 0.5*0.350*0.040^2);  % both wheels (0.0022 ea) + both
+                                   % motors' own spin inertia (0.5*m*r^2,
+                                   % r=40mm cylinder, 0.00028 ea)  [kg m^2]
+p.m_l = 2*(0.210 + 0.210 + 0.270 + 0.270);  % both legs: 2x(rear thigh +
+                                   % front thigh + rear shin + front shin),
+                                   % 210g/270g each                     [kg]
+p.I_l = 2*(0.00055 + 0.00055 + 0.002 + 0.002);  % both legs: sum of each
+                                   % link's OWN about-its-own-COM inertia
+                                   % (thigh 0.00055, shin 0.002 each) --
+                                   % same coarse "one lumped virtual leg"
+                                   % fidelity the rest of this model
+                                   % already uses, not a true composite-
+                                   % rigid-body reduction of the 4-link
+                                   % linkage                          [kg m^2]
 p.m_b = 9.90;        % body + electronics + payload                    [kg]
 p.I_b = 0.08;      % body about its COM, pitch axis                  [kg m^2]
 
 p.R   = 0.092;      % wheel radius                                    [m]
 p.l_c = 0.5;        % leg COM distance from WHEEL AXLE, FRACTION of L [-]
+                     % ("COM for all legs is in the middle")
 p.l_b = 0.060;      % body COM distance from hip, along +body axis    [m]
+                     % (the body's KE/PE formulas already place it
+                     % symmetrically over O = midpoint(A,E) at ph=0 --
+                     % "body COM halfway between the two hips along x" is
+                     % automatically true by construction, not a separate
+                     % number to set; l_b is the SEPARATE vertical/pitch-
+                     % axis offset from the hip line up to the body COM)
 
 % --- 5-bar geometry (see ik/fk for the labelling)
 p.l1 = 0.130;       % rear thigh   A->B
@@ -168,11 +227,36 @@ end
 function [L0, thL, C] = fk(p, phi1, phi4)
 %FK  Forward kinematics of the symmetric parallel 5-bar.
 %
-%     A = (-l5/2, 0)  rear hip pivot,  drives AB at angle phi1 from +x
+%     A = (-l5/2, 0)  rear hip pivot,  drives AB at angle phi1 from -x
+%                      (i.e. phi1=0 points BACKWARD, away from the body
+%                      center -- "back hip negative X"), phi1 CW-positive
 %     E = (+l5/2, 0)  front hip pivot, drives ED at angle phi4 from +x
-%     B = A + l1*(cos phi1, sin phi1)
-%     D = E + l4*(cos phi4, sin phi4)
+%                      (phi4=0 points FORWARD, away from the body center
+%                      -- "front hip positive X"), phi4 CCW-positive --
+%                      OPPOSITE rotational sense from phi1 (confirmed
+%                      2026-09-02: front CCW-positive, rear CW-positive --
+%                      swapped from an earlier version of this file that
+%                      had it backward, front CW / rear CCW). Both zero
+%                      references point outward/away from the body
+%                      centerline, matching a real leg's natural "neutral"
+%                      thigh direction and the real hardware's mirror-
+%                      mounted front/rear hip actuators. This front/rear
+%                      asymmetry is independent of, and not to be confused
+%                      with, the separate left/right HIP_SIGN mirror
+%                      correction CANMotor.cpp applies -- that one is
+%                      untouched; this is baked into fk/ik/jac themselves.
+%     B = A - l1*(cos phi1, -sin phi1)          <- note the -sin, from
+%                                                   phi1 being CW-positive
+%     D = E + l4*(cos phi4, sin phi4)           <- plain +sin, from phi4
+%                                                   being CCW-positive
 %     C = foot / wheel axle = circle(B,l2) INTERSECT circle(D,l3), LOWER branch
+%
+%   SYMMETRY CHECK (why this is the right convention): with both zero
+%   references pointing outward, phi1=phi4=X is an EXACT symmetric/
+%   straight-down pose (thL=0) for EVERY X, not a coincidence at one
+%   value -- verified in selfcheck(). This symmetry property is preserved
+%   regardless of which of phi1/phi4 is CW vs CCW, since it only depends
+%   on the zero-reference directions, not the rotational sense.
 %
 %   Returns the virtual leg length L0 = |OC| (O = midpoint of A,E) and the
 %   leg angle thL = atan2(x_C, -y_C), where thL = 0 is straight down and
@@ -194,8 +278,8 @@ function [L0, thL, C] = fk(p, phi1, phi4)
 
 A = [-p.l5/2; 0];
 E = [ p.l5/2; 0];
-B = A + p.l1*[cos(phi1); sin(phi1)];
-D = E + p.l4*[cos(phi4); sin(phi4)];
+B = A - p.l1*[cos(phi1); -sin(phi1)];   % phi1 zero points -x, CW-positive -- see header comment
+D = E + p.l4*[cos(phi4);  sin(phi4)];   % phi4 zero points +x, CCW-positive -- see header comment
 
 BD = D - B;
 d  = hypot(BD(1), BD(2));
@@ -216,13 +300,15 @@ end
 
 function [phi1, phi4] = ik(p, L0, thL)
 %IK  Closed-form inverse kinematics. No iteration, no initial guess.
+%   phi1 (rear) CW-positive, phi4 (front) CCW-positive -- see fk()'s header
+%   comment for why these are opposite senses.
 C = [L0*sin(thL); -L0*cos(thL)];
 A = [-p.l5/2; 0];
 E = [ p.l5/2; 0];
 B = circInt(A, p.l1, C, p.l2, 'left');    % knee out the back
 D = circInt(E, p.l4, C, p.l3, 'right');   % knee out the front
-phi1 = atan2(B(2)-A(2), B(1)-A(1));
-phi4 = atan2(D(2)-E(2), D(1)-E(1));
+phi1 = atan2(B(2)-A(2), A(1)-B(1));       % zero points -x, CW-positive -- see fk()'s header comment
+phi4 = atan2(D(2)-E(2), D(1)-E(1));       % zero points +x, CCW-positive
 end
 
 function P = circInt(P1, r1, P2, r2, pick)
@@ -368,8 +454,8 @@ kTail = {l1, l2, l3, l4, l5};                          % must match kargs() orde
 % branch for this symbolic version to encode -- it's a fixed choice.
 A5  = [-l5/2; 0];
 E5  = [ l5/2; 0];
-B5  = A5 + l1*[cos(phi1); sin(phi1)];
-D5  = E5 + l4*[cos(phi4); sin(phi4)];
+B5  = A5 - l1*[cos(phi1); -sin(phi1)];   % phi1 zero points -x, CW-positive -- see fk()'s header comment
+D5  = E5 + l4*[cos(phi4);  sin(phi4)];   % phi4 zero points +x, CCW-positive -- see fk()'s header comment
 BD5 = D5 - B5;
 d5  = sqrt(BD5(1)^2 + BD5(2)^2);
 a5  = (l2^2 - l3^2 + d5^2) / (2*d5);
@@ -468,6 +554,69 @@ end
 A_fun = matlabFunction(Alin, 'Vars', [{L}, pTail]);
 B_fun = matlabFunction(Blin, 'Vars', [{L}, pTail]);
 
+% ============================================================
+% Part 3: velocity-controlled-wheel reduction -- the wheel motor
+% (GIM6010-8) runs in ODrive VELOCITY mode, not torque mode (see
+% CANMotor.cpp/main.cpp's motor registration and controls_plan.md). The
+% wheel's own low-level velocity loop supplies whatever torque T is needed
+% to track a commanded acceleration; from the balance controller's
+% perspective the wheel is a KINEMATIC input (ax = xddot, commanded
+% directly and integrated into a velocity setpoint by the firmware each
+% 100 Hz control tick -- see linearModelVel()'s header), not a torque
+% input. T becomes an emergent/internal quantity, eliminated by solving
+% ITS OWN equation of motion (the x/wheel row) and substituting into the
+% theta/phi rows -- an INPUT substitution, not the holonomic-constraint
+% coordinate reduction the rigid-hip case below uses, since x remains a
+% real (if unforced-by-T) degree of freedom, not removed by a constraint.
+%
+% eqs(1) (the x/wheel row) is LINEAR in T (Qf(1) = T/R only, see Qf above),
+% so this is an exact, closed-form elimination, not a generic (expensive)
+% matrix inverse. eqs(3) (the phi row) never contained T to begin with
+% (Qf(3) = -Tp only), so it needs no substitution.
+Tsol  = solve(eqs(1) == 0, T);
+eqs_v = [subs(eqs(2), T, Tsol); eqs(3)];
+
+Mv_sym  = jacobian(eqs_v, [ath; aph]);   % 2x2, f(th,ph,L) only
+Buv_sym = -jacobian(eqs_v, [ax; Tp]);    % 2x2, f(th,ph,L) -- NOT constant
+                                          % like BuSym: ax's coupling into
+                                          % the theta row runs through
+                                          % Tsol's own M11/M21 dependence
+                                          % on configuration.
+hv_sym  = simplify(subs(eqs_v, [ath; aph; ax; Tp], [0; 0; 0; 0]));
+
+Mv_fun  = matlabFunction(Mv_sym,  'Vars', [{th, ph, L}, pTail]);
+hv_fun  = matlabFunction(hv_sym,  'Vars', [{th, ph, dx, dth, dph, L}, pTail]);
+Buv_fun = matlabFunction(Buv_sym, 'Vars', [{th, ph, L}, pTail]);
+
+% ---- linearize the REDUCED (theta,phi) model about upright -- same
+%      implicit-differentiation trick as the full model just above, on 2
+%      DOF instead of 3. dx (wheel velocity) drops out of this
+%      linearization entirely: every eqs_v term depending on dx is a
+%      Coriolis-type PRODUCT of two velocities (dx*dth, dx*dph), which
+%      vanishes at first order about the v=0 equilibrium the same way the
+%      full model's own Coriolis terms already do -- dx is retained as a
+%      state only in the NONLINEAR reduced dynamics (nlDynamicsVel) below,
+%      not in this linear (Av,Bv) pair. ----
+qv   = [th; ph];  vv = [dth; dph];
+Jqvv = jacobian(eqs_v, [qv; vv]);        % 2x4
+Juv  = jacobian(eqs_v, [ax; Tp]);        % 2x2 = -Buv_sym
+Mv0   = subs(Mv_sym, atEq, atV);
+Jqvv0 = subs(Jqvv,   atEq, atV);
+Juv0  = subs(Juv,    atEq, atV);
+
+dadqv_v = simplify(-(Mv0 \ Jqvv0));      % 2x4, columns [th,ph,dth,dph]
+dadu_v  = simplify( (Mv0 \ (-Juv0)));    % 2x2
+
+Avlin = sym(zeros(4,4));  Bvlin = sym(zeros(4,2));
+Avlin(1,2) = 1; Avlin(3,4) = 1;
+colmapV = [1 3 2 4];    % [th,ph,dth,dph] -> [th,dth,ph,dph]
+for i = 1:2
+    Avlin(2*i, colmapV) = dadqv_v(i, :);
+    Bvlin(2*i, :)       = dadu_v(i, :);
+end
+Av_fun = matlabFunction(Avlin, 'Vars', [{L}, pTail]);
+Bv_fun = matlabFunction(Bvlin, 'Vars', [{L}, pTail]);
+
 % ---- rigid-hip reduction: substitute the holonomic constraint
 %      theta = phi - legSplay (legSplay constant) INTO THE LAGRANGIAN,
 %      before differentiating -- this is the valid way to reduce a
@@ -499,6 +648,8 @@ Bur_fun = matlabFunction(BurSym, 'Vars', {R});
 
 model = struct('M_fun', M_fun, 'h_fun', h_fun, 'Bu_fun', Bu_fun, ...
                 'A_fun', A_fun, 'B_fun', B_fun, ...
+                'Mv_fun', Mv_fun, 'hv_fun', hv_fun, 'Buv_fun', Buv_fun, ...
+                'Av_fun', Av_fun, 'Bv_fun', Bv_fun, ...
                 'Mr_fun', Mr_fun, 'hr_fun', hr_fun, 'Bur_fun', Bur_fun, ...
                 'Jfk_fun', Jfk_fun);
 CACHED = model;
@@ -535,6 +686,43 @@ h  = model.h_fun(th, ph, dx, dth, dph, L, c{:});
 Bu = model.Bu_fun(p.R);
 qdd = M \ (Bu*u(:) - h);
 ds  = [s(4); s(5); s(6); qdd(1); qdd(2); qdd(3)];
+end
+
+function [Av, Bv] = linearModelVel(p, L)
+%LINEARMODELVEL  4-state linearization about upright for a VELOCITY-
+%   CONTROLLED wheel (ODrive velocity mode -- see CANMotor.cpp/main.cpp;
+%   hips stay torque-controlled, unaffected). The wheel's own torque T is
+%   eliminated as a free input (see Part 3 of getSymbolicModel); the
+%   balance loop's wheel input becomes ax = xddot (a commanded
+%   acceleration), which the firmware integrates into a velocity setpoint
+%   each 100 Hz control tick (v_cmd[k+1] = v_meas[k] + ax*dt) rather than
+%   sending torque directly.
+%   X = [theta; thetadot; phi; phidot],  u = [ax; Tp]
+%   (x, xdot are deliberately NOT states here -- xdot's own dynamics,
+%   xdot_dot = ax, is a trivial decoupled integrator at this
+%   linearization, per Part 3's derivation comment; simulateVel() tracks
+%   it anyway for velocity-reference-tracking and for the nonlinear plant).
+model = getSymbolicModel();
+c = pargs(p);
+Av = model.Av_fun(L, c{:});
+Bv = model.Bv_fun(L, c{:});
+end
+
+function ds = nlDynamicsVel(p, s, u, L)
+%NLDYNAMICSVEL  FULL nonlinear reduced equations of motion for a
+%   VELOCITY-CONTROLLED wheel (no small-angle assumption) -- see
+%   linearModelVel's header and Part 3 of getSymbolicModel.
+%   s = [theta; phi; xdot; thetadot; phidot],  u = [ax; Tp]
+%   ax (u(1)) is the commanded wheel acceleration; xdot's own derivative is
+%   exactly ax by definition (perfect low-level velocity tracking assumed).
+model = getSymbolicModel();
+c = pargs(p);
+th = s(1); ph = s(2); dx = s(3); dth = s(4); dph = s(5);
+Mv  = model.Mv_fun(th, ph, L, c{:});
+hv  = model.hv_fun(th, ph, dx, dth, dph, L, c{:});
+Buv = model.Buv_fun(th, ph, L, c{:});
+qdd = Mv \ (Buv*u(:) - hv);
+ds  = [s(4); s(5); u(1); qdd(1); qdd(2)];
 end
 
 function [A, B, info] = rigidLegModel(p, L, legSplay)
@@ -651,26 +839,129 @@ K = R \ (B'*P);
 end
 
 % =========================================================================
+% Discrete-time design -- the real controller runs a fixed-rate 100 Hz
+% loop (main.cpp's ControlThread, TIME_US2I(10000), confirmed against real
+% hardware's RMD reply-rate ceiling -- see main.cpp's comment), holding
+% each computed torque/velocity command constant (zero-order hold) for one
+% full 1/100 s tick, NOT integrating continuously between updates. A
+% continuous-time Riccati gain applied inside a ZOH loop (what
+% simulate()/simulatePid() already did, and still a fine approximation for
+% a fast loop relative to the plant) is a different thing from actually
+% DESIGNING the gain against the discretized, sampled-data plant -- these
+% two functions do the latter: discretize() converts (A,B) to the exact
+% ZOH-equivalent (Ad,Bd) at a given dt, and dlqrGain() solves the discrete
+% (not continuous) Riccati equation against them.
+% =========================================================================
+function [Ad, Bd] = discretize(A, B, dt)
+%DISCRETIZE  Exact zero-order-hold discretization of continuous (A,B) at
+%   sample period dt -- X[k+1] = Ad*X[k] + Bd*u[k], u held constant over
+%   each sample. Uses the standard block matrix-exponential identity
+%   (expm is base MATLAB/Octave, no toolbox needed):
+%       [Ad Bd; 0 I] = expm([A*dt, B*dt; 0, 0])
+n = size(A, 1);  m = size(B, 2);
+M  = expm([A*dt, B*dt; zeros(m, n + m)]);
+Ad = M(1:n, 1:n);
+Bd = M(1:n, n+1:n+m);
+end
+
+function P = dareIter(Ad, Bd, Q, R)
+%DAREITER  Toolbox-free discrete algebraic Riccati equation solver via the
+%   standard Riccati value-iteration recursion:
+%       P_{k+1} = Q + Ad'*P_k*Ad - Ad'*P_k*Bd*inv(R+Bd'*P_k*Bd)*Bd'*P_k*Ad
+%   Converges monotonically to the stabilizing solution for a stabilizable/
+%   detectable (Ad,Bd,Q) pair (standard result). FALLBACK ONLY --
+%   dlqrGain() below prefers dlqr()/idare() when the Control System
+%   Toolbox is present; this needs no toolbox and runs offline (gain-table
+%   generation, not real-time), so the iteration count is not a speed
+%   concern the way careSchur's one-shot Schur form was written to avoid.
+P = Q;
+for k = 1:2000
+    S     = R + Bd'*P*Bd;
+    Pnext = Q + Ad'*P*Ad - (Ad'*P*Bd) * (S \ (Bd'*P*Ad));
+    Pnext = (Pnext + Pnext')/2;
+    if max(max(abs(Pnext - P))) < 1e-12 * max(1, max(max(abs(P))))
+        P = Pnext;
+        return
+    end
+    P = Pnext;
+end
+error('wheeled_biped:dare', 'dareIter did not converge in 2000 iterations.');
+end
+
+function [K, P] = dlqrGain(Ad, Bd, Q, R)
+%DLQRGAIN  Discrete-time LQR. u[k] = -K*x[k], x[k+1] = (Ad-Bd*K)*x[k].
+%   Uses Control System Toolbox's dlqr()/idare() when available, falls
+%   back to the toolbox-free dareIter() above -- same try/catch-over-
+%   exist() pattern as lqrGain(). OUTPUT-ORDER CAUTION, same bug class
+%   controls_plan.md section 0 already found and fixed for the continuous
+%   case: dlqr() returns [K,S,e] (GAIN FIRST), but idare() returns
+%   [X,K,L] (RICCATI SOLUTION FIRST, gain second) -- opposite conventions,
+%   exactly mirroring lqr() vs icare() above. Get this backwards and every
+%   discrete gain is silently wrong the same way every continuous one
+%   briefly was.
+try
+    [K, P] = dlqr(Ad, Bd, Q, R);
+    return
+catch
+end
+try
+    [P, K] = idare(Ad, Bd, Q, R);
+    return
+catch
+end
+P = dareIter(Ad, Bd, Q, R);
+K = (R + Bd'*P*Bd) \ (Bd'*P*Ad);
+end
+
+% =========================================================================
 % Gain scheduling on leg length
 % =========================================================================
-function sched = scheduleGains(p, Q, R, Lgrid, order, model)
+function sched = scheduleGains(p, Q, R, Lgrid, order, model, dt)
 %SCHEDULEGAINS  Solve the LQR at each leg length, fit each gain vs L.
 %   Fits in a NORMALIZED variable u=(L-Lmid)/Lhalf -- a raw cubic in L over a
 %   narrow range like [0.16,0.34] gives a badly conditioned Vandermonde
 %   matrix. Use evalGains to evaluate it.
+%
+%   model: '6state' (default, torque-controlled wheel, 6-state full model),
+%          'velwheel' (velocity-controlled wheel -- see linearModelVel,
+%          4-state [theta,thetadot,phi,phidot], u=[ax,Tp] -- the real
+%          firmware's wheel actuation mode, see CANMotor.cpp), or 'rigid'
+%          (stiff position-controlled hips, KNOWN LIMITATION -- see
+%          rigidLegModel's help).
+%
+%   dt: if given (nonempty), design a DISCRETE-time LQR against the exact
+%       zero-order-hold discretization of (A,B) at this sample period
+%       (discretize() + dlqrGain()) instead of the continuous-time design
+%       (lqrGain()) -- matching the real 100 Hz ControlThread, which holds
+%       each computed command for a full 1/100 s tick rather than applying
+%       it continuously. Continuous Q/R are converted to their discrete
+%       equivalents via the standard small-dt rectangle-rule approximation
+%       Qd=Q*dt, Rd=R*dt (so the discrete cost sum(x'Qd*x + u'Ru*dt)
+%       approximates the continuous integral cost) -- an approximation,
+%       like every other placeholder weighting in this file; retune Q/R
+%       directly in discrete terms once real closed-loop data exists if
+%       this doesn't feel right. Omit/empty dt to keep the original
+%       continuous-time design (default, backward compatible).
 if nargin < 5 || isempty(order), order = 3;         end
 if nargin < 6 || isempty(model), model = '6state';  end
+if nargin < 7,                   dt    = [];        end
 
 Lgrid = Lgrid(:);
 nL = numel(Lgrid);
 Ks = [];
 for i = 1:nL
     switch model
-        case '6state', [A, B] = linearModel(p, Lgrid(i));
-        case 'rigid',  [A, B] = rigidLegModel(p, Lgrid(i));
-        otherwise, error('wheeled_biped:model', 'model must be 6state or rigid');
+        case '6state',  [A, B] = linearModel(p, Lgrid(i));
+        case 'velwheel', [A, B] = linearModelVel(p, Lgrid(i));
+        case 'rigid',   [A, B] = rigidLegModel(p, Lgrid(i));
+        otherwise, error('wheeled_biped:model', 'model must be 6state, velwheel, or rigid');
     end
-    K = lqrGain(A, B, Q, R);
+    if isempty(dt)
+        K = lqrGain(A, B, Q, R);
+    else
+        [Ad, Bd] = discretize(A, B, dt);
+        K = dlqrGain(Ad, Bd, Q*dt, R*dt);
+    end
     if isempty(Ks), Ks = zeros(nL, size(K,1), size(K,2)); end
     Ks(i,:,:) = K; %#ok<AGROW>
 end
@@ -688,7 +979,7 @@ for i = 1:nu
 end
 
 sched = struct('c', c, 'Lmid', Lmid, 'Lhalf', Lhalf, ...
-               'Lgrid', Lgrid, 'Kgrid', Ks, 'order', order, 'model', model);
+               'Lgrid', Lgrid, 'Kgrid', Ks, 'order', order, 'model', model, 'dt', dt);
 end
 
 function K = evalGains(sched, L)
@@ -741,7 +1032,10 @@ function [t, S, U, Sy] = simulate(p, sched, L, s0, tf, uLim, opts)
 if nargin < 5 || isempty(tf),   tf   = 6;                        end
 if nargin < 6 || isempty(uLim), uLim = [2*p.tau_wheel_peak, 40]; end
 if nargin < 7, opts = struct(); end
-if ~isfield(opts, 'dt'),       opts.dt = 1/400;              end
+% 100 Hz -- matches main.cpp's real ControlThread rate (TIME_US2I(10000),
+% confirmed 2026-09-02 against real hardware's RMD reply-rate ceiling, see
+% that file's comment), NOT a rounder/faster number picked for convenience.
+if ~isfield(opts, 'dt'),       opts.dt = 1/100;              end
 if ~isfield(opts, 'noiseStd')
     % Rough IMU/encoder-class placeholders, NOT measured on real hardware --
     % replace once real sensor noise is characterized. Order matches s0:
@@ -799,6 +1093,130 @@ end
 function u = satur(u, lim)
 u(1) = max(min(u(1),  lim(1)), -lim(1));
 u(2) = max(min(u(2),  lim(2)), -lim(2));
+end
+
+function [t, S, U, Sy] = simulateVel(p, sched, L, s0, tf, uLim, opts)
+%SIMULATEVEL  Same closed-loop harness as simulate() (scheduled LQR on the
+%             FULL nonlinear plant, fixed-rate stepping, explicit noisy/
+%             delayed sensor model -- see simulate()'s help for the shared
+%             details), but for a VELOCITY-CONTROLLED wheel: sched must
+%             come from scheduleGains(..., 'velwheel', dt) (4-state
+%             [theta,thetadot,phi,phidot], u=[ax,Tp] -- see
+%             linearModelVel()). ax is a wheel ACCELERATION command, not
+%             torque -- the firmware integrates it into a velocity
+%             setpoint each control tick (v_cmd[k+1] = v_meas[k] +
+%             ax*dt), matching the ODrive velocity-mode wheel actuation in
+%             CANMotor.cpp/main.cpp. Hips remain torque-controlled (Tp),
+%             unchanged from simulate().
+%
+%   s0   = [theta; phi; xdot; thetadot; phidot]  (true initial state)
+%   uLim = [ax_max, Thip_max] saturation
+%
+%   Velocity-reference tracking: since xdot is no longer an LQR feedback
+%   state at all (see linearModelVel()'s header -- it drops out of the
+%   linearization entirely, decoupled), tracking vRef(t) can't be folded
+%   into the state vector the way simulate() does it for the torque-
+%   controlled model (there, xdot IS a native state, so a velocity error
+%   just substitutes for it directly). Instead, velocity error biases the
+%   THETA (leg angle) error term the LQR already feeds back on:
+%       theta_ref = thetaBiasKp * (xdot_meas - vRef(t))
+%       x_lqr(1)  = theta_meas - theta_ref     (all other rows unchanged)
+%   i.e. "run a little faster than commanded -> lean the leg back a
+%   little" -- the LQR's own balance authority does the rest, since
+%   correcting a nonzero theta error is exactly what it already does. This
+%   works WITH the LQR's stabilizing structure instead of injecting an
+%   independent term on ax that fights it -- an earlier version of this
+%   function added opts.velKp*(vRef-xdot) directly onto ax, which is
+%   dynamically the SAME channel the LQR uses for balance and reliably
+%   destabilized the whole loop (verified: with that term removed, i.e.
+%   pure regulation, theta/phi settle immediately from a 20 deg tilt to
+%   equilibrium; adding it back at velKp=2 blew theta up past 290 deg on
+%   every tested case) -- do not resurrect that approach. thetaBiasKp's
+%   default below (0.15) reuses the same magnitude as
+%   PidBalanceController's vel_kp (defaultPidGains' gains.vel_kp), the
+%   analogous velocity-error-to-lean-angle gain in that cascade -- verified
+%   empirically to converge xdot to a stepped 0.3 m/s reference within
+%   ~2-3 s with only a few degrees of theta/phi excursion, no
+%   instability, at kv=0.15; kv=0.05 also stable but slower; NEGATIVE kv
+%   is the wrong sign and diverges just like the old ax-injection approach
+%   did -- see git history / session notes for the numerical sweep.
+%
+%   opts: same fields as simulate() (dt, noiseStd, delay, vRef,
+%   stepCallback), plus:
+%     thetaBiasKp   theta_ref = thetaBiasKp*(xdot_meas-vRef(t))   [rad/(m/s)]
+%   noiseStd order matches s0: theta,phi,xdot,thetadot,phidot.
+%
+%   L may be a plain scalar (fixed leg length, as elsewhere in this file)
+%   OR a function handle @(t)->L, evaluated once per control tick and fed
+%   to BOTH evalGains (so K tracks the CURRENT leg length, exactly what
+%   gain scheduling already exists for) and nlDynamicsVel (the plant).
+%   This treats a leg-length trajectory as an idealized, instantaneously-
+%   achieved SCHEDULE PARAMETER, same as evalGains already assumes for any
+%   single L -- there's no separate leg-length actuator/inertia modeled
+%   here (see controls_plan.md section 6: a real height controller is its
+%   own design problem). Fine for exploring how gain-scheduled balance
+%   behaves through a commanded height change; don't mistake it for a
+%   validated model of the actual crouch/extend transient.
+if nargin < 5 || isempty(tf),   tf   = 6;                        end
+if nargin < 6 || isempty(uLim), uLim = [20, 40];                 end
+if nargin < 7, opts = struct(); end
+if ~isfield(opts, 'dt'),       opts.dt = 1/100;              end
+if ~isfield(opts, 'noiseStd')
+    % Rough IMU/encoder-class placeholders, same status as simulate()'s.
+    % Order matches s0: theta,phi,xdot,thetadot,phidot.
+    opts.noiseStd = [0.005, 0.005, 0.08, 0.05, 0.05];
+end
+if ~isfield(opts, 'delay'),        opts.delay = 0;         end
+if ~isfield(opts, 'vRef'),         opts.vRef  = @(t) 0;    end
+if ~isfield(opts, 'thetaBiasKp'),  opts.thetaBiasKp = 0.15; end
+if ~isfield(opts, 'stepCallback'), opts.stepCallback = []; end
+
+if isa(L, 'function_handle'), Lfun = L; else, Lfun = @(~) L; end
+
+dt      = opts.dt;
+nDelay  = max(0, round(opts.delay/dt));
+nSteps  = max(1, round(tf/dt));
+odeOpts = odeset('RelTol', 1e-8, 'AbsTol', 1e-10);
+
+s  = s0(:);
+t  = zeros(nSteps+1, 1);
+S  = zeros(nSteps+1, 5); S(1,:)  = s.';
+Sy = zeros(nSteps+1, 5); Sy(1,:) = s.';
+U  = zeros(nSteps+1, 2);
+
+delayBuf = repmat(s.', nDelay+1, 1);   % ring buffer, oldest row first
+
+for k = 1:nSteps
+    tk = (k-1)*dt;
+    Lk = Lfun(tk);
+
+    % ---- sensor model: additive noise on the TRUE state, then delay ----
+    s_meas   = s + opts.noiseStd(:).*randn(5,1);
+    delayBuf = [delayBuf(2:end, :); s_meas.'];
+    s_ctrl   = delayBuf(1, :).';
+
+    % ---- velocity-reference tracking: bias the theta error term, see
+    %      this function's help for why (xdot isn't an LQR state here, and
+    %      biasing ax directly destabilizes the loop) ----
+    theta_ref = opts.thetaBiasKp * (s_ctrl(3) - opts.vRef(tk));
+
+    % evalGains order matches linearModelVel: [theta,thetadot,phi,phidot]
+    x_lqr = [s_ctrl(1) - theta_ref; s_ctrl(4); s_ctrl(2); s_ctrl(5)];
+    u     = satur(-evalGains(sched, Lk) * x_lqr, uLim);
+
+    [~, ss] = ode45(@(~, y) nlDynamicsVel(p, y, u, Lk), [tk, tk + dt], s, odeOpts);
+    s = ss(end, :).';
+
+    t(k+1)    = tk + dt;
+    S(k+1, :) = s.';
+    Sy(k+1,:) = s_ctrl.';
+    U(k, :)   = u.';
+
+    if ~isempty(opts.stepCallback)
+        opts.stepCallback(t(k+1), s, u);
+    end
+end
+U(end, :) = U(end-1, :);
 end
 
 % =========================================================================
@@ -1025,8 +1443,8 @@ thL = phi_vis - theta_vis;
 
 Abf = [-p.l5/2; 0];
 Ebf = [ p.l5/2; 0];
-Bbf = Abf + p.l1*[cos(phi1); sin(phi1)];
-Dbf = Ebf + p.l4*[cos(phi4); sin(phi4)];
+Bbf = Abf - p.l1*[cos(phi1); -sin(phi1)];   % phi1 zero points -x, CW-positive -- see fk()'s header comment
+Dbf = Ebf + p.l4*[cos(phi4);  sin(phi4)];   % phi4 zero points +x, CCW-positive -- see fk()'s header comment
 [~, ~, Cbf] = wb.fk(p, phi1, phi4);
 
 % illustrative body extent for drawing only (NOT a physical dimension -- the
@@ -1341,6 +1759,103 @@ fprintf('   hip-lock Tp sign for thL=phi-theta > target : %s\n', pf(hipSignOk));
 velSignOk = U2(1,1) < 0;
 fprintf('   wheel torque sign on a forward-velocity step from rest      : %s\n', pf(velSignOk));
 ok = ok && hipSignOk && velSignOk;
+
+hdr('14. phi1/phi4 sign convention: rear CW-positive, front CCW-positive');
+% Analytic cross-product check (not a numeric-tolerance one): a small
+% positive rotation should move the arm's tip in the direction of its own
+% angular derivative, so cross_z(arm, d(arm)/dphi) is positive for a
+% CCW-positive angle and negative for a CW-positive one -- see fk()'s
+% header comment for phi1 (rear, CW+) vs phi4 (front, CCW+).
+cross_z = @(u, v) u(1)*v(2) - u(2)*v(1);
+signsOk = true;
+for phi1t = deg2rad([-20 0 20])
+    for phi4t = deg2rad([-20 0 20])
+        arm1  = -p.l1*[cos(phi1t); -sin(phi1t)];   % B-A: zero points -x, CW+
+        darm1 = -p.l1*[-sin(phi1t); -cos(phi1t)];
+        arm4  =  p.l4*[cos(phi4t);  sin(phi4t)];   % D-E: zero points +x, CCW+
+        darm4 =  p.l4*[-sin(phi4t);  cos(phi4t)];
+        if cross_z(arm1, darm1) >= 0, signsOk = false; end   % phi1 must be CW (-)
+        if cross_z(arm4, darm4) <= 0, signsOk = false; end   % phi4 must be CCW (+)
+    end
+end
+fprintf('   phi1 (rear) CW-positive, phi4 (front) CCW-positive : %s\n', pf(signsOk));
+ok = ok && signsOk;
+
+% phi1's zero (-x, "back hip negative X") and phi4's zero (+x, "front hip
+% positive X") both point OUTWARD from the body centerline -- so phi1=phi4
+% should be an EXACT symmetric/straight-down pose (thL=0) for every value,
+% not a coincidence at one angle (this is what "same command on both
+% motors -> straight leg" requires -- see fk()'s header comment; caught
+% and fixed 2026-09-02 after phi1's zero was found pointing +x instead).
+worstSym2 = 0;
+for Xd = [-30 -10 0 10 16 30]
+    [~, thLx] = fk(p, deg2rad(Xd), deg2rad(Xd));
+    worstSym2 = max(worstSym2, abs(thLx));
+end
+fprintf('   phi1=phi4=X is symmetric (thL=0) for every X : %.3e rad   %s\n', worstSym2, pf(worstSym2 < 1e-9));
+ok = ok && worstSym2 < 1e-9;
+
+hdr('15. Velocity-controlled-wheel reduction (linearModelVel), 4-state, at L = 0.25 m');
+[Av, Bv] = linearModelVel(p, 0.25);
+disp('Av ='); disp(round(Av*1e4)/1e4);
+disp('Bv ='); disp(round(Bv*1e4)/1e4);
+Cmv = ctrbMat(Av, Bv);
+rv  = rank(Cmv);
+fprintf('   controllability rank (ax and Tp) : %d/4  %s\n', rv, pf(rv == 4));
+ok = ok && rv == 4;
+fprintf('   open-loop eigenvalues: ');
+fprintf('%+.4f ', sort(real(eig(Av)))); fprintf('\n');
+
+hdr('16. Discrete-time (100 Hz) LQR design: closed-loop stability');
+% Matches main.cpp's real ControlThread rate -- see this file's top-of-file
+% header comment and scheduleGains()'s dt argument.
+dtCk = 1/100;
+[A6, B6]   = linearModel(p, 0.25);
+[Ad6, Bd6] = discretize(A6, B6, dtCk);
+K6d  = dlqrGain(Ad6, Bd6, Q*dtCk, R*dtCk);        % Q,R from section 7/8 above
+ev6d = abs(eig(Ad6 - Bd6*K6d));
+fprintf('   6state discrete closed-loop |eig| (must be <1)   : ');
+fprintf('%.4f ', sort(ev6d)); fprintf('  %s\n', pf(max(ev6d) < 1));
+ok = ok && max(ev6d) < 1;
+
+% Placeholder weights for the [ax,Tp] input -- ax (m/s^2) and Tp (N.m) are
+% different physical units from [T,Tp] above, so Q/R above don't carry
+% over numerically; theta/phi state weights are kept the same, R re-guessed
+% for the new input scale. Retune once real closed-loop data exists, same
+% status as every other Q/R placeholder in this file.
+Qv = diag([40 2 800 8]);   % [theta, thetadot, phi, phidot]
+Rv = diag([1 3]);          % [ax, Tp]
+[Avv, Bvv] = linearModelVel(p, 0.25);
+[Adv, Bdv] = discretize(Avv, Bvv, dtCk);
+Kvd  = dlqrGain(Adv, Bdv, Qv*dtCk, Rv*dtCk);
+evvd = abs(eig(Adv - Bdv*Kvd));
+fprintf('   velwheel discrete closed-loop |eig| (must be <1) : ');
+fprintf('%.4f ', sort(evvd)); fprintf('  %s\n', pf(max(evvd) < 1));
+ok = ok && max(evvd) < 1;
+
+% dareIter cross-check against dlqrGain's preferred solver (same spirit as
+% section 7's careSchur cross-check) -- forces the toolbox-free fallback
+% path and compares its gain against whatever dlqrGain() actually used.
+Pfb  = dareIter(Adv, Bdv, Qv*dtCk, Rv*dtCk);
+Kfb  = (Rv*dtCk + Bdv'*Pfb*Bdv) \ (Bdv'*Pfb*Adv);
+eDare = max(max(abs(Kvd - Kfb)));
+fprintf('   ||K_dlqrGain - K_dareIter||_inf                  : %.3e   %s\n', eDare, pf(eDare < 1e-6));
+ok = ok && eDare < 1e-6;
+
+hdr('17. Velocity-wheel nonlinear closed-loop recovery (discrete 100 Hz LQR)');
+schedV = scheduleGains(p, Qv, Rv, linspace(0.16, 0.34, 25), 3, 'velwheel', dtCk);
+fprintf('   %7s %10s %10s %10s %10s\n', 'L [m]', 'th0 [deg]', 'settled?', '|th|max', '|ph|max');
+for L = [0.18 0.25 0.32]
+    for th0 = [5 10 20]
+        s0v = [deg2rad(th0); deg2rad(th0); 0; 0; 0];
+        [~, Sv] = simulateVel(p, schedV, L, s0v, 6, [], struct('noiseStd', zeros(1,5), 'dt', dtCk));
+        finv = abs(Sv(end,:));
+        settledV = finv(1) < 0.02 && finv(2) < 0.02 && abs(Sv(end,3)) < 0.05;
+        fprintf('   %7.2f %10.0f %10s %9.1fd %9.1fd\n', ...
+                L, th0, tf2s(settledV), rad2deg(max(abs(Sv(:,1)))), rad2deg(max(abs(Sv(:,2)))));
+        ok = ok && settledV;
+    end
+end
 
 fprintf('\n%s\n', repmat('=', 1, 72));
 if ok, fprintf('ALL CHECKS PASS\n'); else, fprintf('SOME CHECKS FAILED\n'); end

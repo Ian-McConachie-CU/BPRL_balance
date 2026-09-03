@@ -127,6 +127,7 @@ CPPSRC = $(ALLCPPSRC) \
          src/CAN.cpp \
          src/RmdMotor.cpp \
          src/GimMotor.cpp \
+         src/OdriveMotor.cpp \
          src/Imx5.cpp \
          src/CmdShell.cpp \
          src/usb_serial.cpp

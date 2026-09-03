@@ -38,8 +38,9 @@ void SbusParser::update()
             if (_count == 25) {
                 if (_buf[24] == 0x00) {
                     unpack(&_buf[1], _ch);
-                    _frame_lost = (_buf[23] >> 2) & 0x01;
-                    _failsafe   = (_buf[23] >> 3) & 0x01;
+                    _frame_lost     = (_buf[23] >> 2) & 0x01;
+                    _failsafe       = (_buf[23] >> 3) & 0x01;
+                    _frame_received = true;
                 }
                 _state = State::WAIT_START;
                 _count = 0;
@@ -52,6 +53,19 @@ void SbusParser::update()
 uint16_t SbusParser::channel(uint8_t n) const
 {
     return (n < 16) ? _ch[n] : 992u;
+}
+
+bool SbusParser::take_frame_received()
+{
+    const bool r = _frame_received;
+    _frame_received = false;
+    return r;
+}
+
+void SbusParser::mark_stale()
+{
+    _frame_lost = true;
+    _failsafe   = true;
 }
 
 void SbusParser::unpack(const uint8_t *data, uint16_t *ch)

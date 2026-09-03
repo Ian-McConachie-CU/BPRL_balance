@@ -134,7 +134,9 @@ def _read_line_ex(ser: serial.Serial, timeout: float = 5.0):
 @dataclass
 class TelState:
     # $TEL,time_ms,roll°,pitch°,yaw°,p,q,r,thr,rc_roll,rc_pitch,rc_yaw,armed,
-    #      imu0_v,imu1_v,imu2_v,can_v,can_quat_hz,can_rate_hz
+    #      imu0_v,imu1_v,imu2_v,can_v,can_quat_hz,can_rate_hz,
+    #      leg_L,leg_L_dot,leg_pitch°,leg_pitch_dot,wheel_vel_L,wheel_vel_R,
+    #      body_u,body_w
     time_ms:      float = 0.0
     roll:         float = 0.0
     pitch:        float = 0.0
@@ -151,6 +153,13 @@ class TelState:
     can_valid:    bool  = False
     can_quat_hz:  int   = 0
     can_rate_hz:  int   = 0
+    leg_L:         float = 0.0   # m, averaged virtual leg length (Kalman/lowpass state)
+    leg_L_dot:     float = 0.0   # m/s
+    leg_pitch:     float = 0.0   # deg, averaged leg pitch (theta = phi - thL)
+    leg_pitch_dot: float = 0.0   # rad/s
+    wheel_vel:     list  = field(default_factory=lambda: [0.0, 0.0])  # rad/s, L/R
+    body_u:        float = 0.0   # m/s, body-frame forward velocity
+    body_w:        float = 0.0   # m/s, body-frame vertical velocity
     received_any: bool  = False
     usb_rx_any:   bool  = False
     last_rx:      float = field(default_factory=time.monotonic)
@@ -163,7 +172,7 @@ def parse_tel_line(line: str, state: TelState) -> bool:
         return False
     try:
         parts = line[5:].split(",")
-        if len(parts) < 18:
+        if len(parts) < 26:
             return False
         state.time_ms     = float(parts[0])
         state.roll        = float(parts[1])
@@ -182,6 +191,13 @@ def parse_tel_line(line: str, state: TelState) -> bool:
         state.can_valid   = bool(int(parts[15]))
         state.can_quat_hz = int(parts[16])
         state.can_rate_hz = int(parts[17])
+        state.leg_L         = float(parts[18])
+        state.leg_L_dot     = float(parts[19])
+        state.leg_pitch     = float(parts[20])
+        state.leg_pitch_dot = float(parts[21])
+        state.wheel_vel     = [float(parts[22]), float(parts[23])]
+        state.body_u        = float(parts[24])
+        state.body_w        = float(parts[25])
         state.received_any = True
         state.usb_rx_any   = True
         state.last_rx      = time.monotonic()
@@ -237,6 +253,8 @@ class EkfLaneState:
     p:            list  = field(default_factory=lambda: [0.0] * 4)
     q:            list  = field(default_factory=lambda: [0.0] * 4)
     r:            list  = field(default_factory=lambda: [0.0] * 4)
+    imu_valid:    list  = field(default_factory=lambda: [False, False, False])
+    can_valid:    bool  = False
     received_any: bool  = False
     usb_rx_any:   bool  = False
     last_rx:      float = field(default_factory=time.monotonic)
@@ -249,7 +267,7 @@ def parse_ekfl_line(line: str, state: EkfLaneState) -> bool:
         return False
     try:
         parts = line[6:].split(",")
-        if len(parts) < 26:
+        if len(parts) < 30:
             return False
         state.time_ms = float(parts[0])
         state.primary = int(parts[1])
@@ -261,6 +279,9 @@ def parse_ekfl_line(line: str, state: EkfLaneState) -> bool:
             state.p[i]     = float(parts[base + 3])
             state.q[i]     = float(parts[base + 4])
             state.r[i]     = float(parts[base + 5])
+        state.imu_valid = [bool(int(parts[26])), bool(int(parts[27])),
+                           bool(int(parts[28]))]
+        state.can_valid = bool(int(parts[29]))
         state.received_any = True
         state.usb_rx_any   = True
         state.last_rx      = time.monotonic()

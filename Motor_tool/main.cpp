@@ -12,6 +12,7 @@
  *   - LK-TECH MG8016E-i6 (RMD-style protocol)  — src/RmdMotor.*
  *   - Steadywin GIM6010-6 (SDC102 driver)      — src/GimMotor.* (protocol
  *     unverified — read the warning at the top of GimMotor.hpp before use)
+ *   - Steadywin GIM6010-8 on a GDS68 (ODrive CAN Simple protocol) — src/OdriveMotor.*
  */
 
 #include "ch.h"
@@ -19,6 +20,7 @@
 #include "src/CAN.hpp"
 #include "src/RmdMotor.hpp"
 #include "src/GimMotor.hpp"
+#include "src/OdriveMotor.hpp"
 #include "src/Imx5.hpp"
 #include "src/CmdShell.hpp"
 #include "src/usb_serial.hpp"
@@ -69,6 +71,7 @@ int main(void)
     can_drv_init();     // FDCAN1 + FDCAN2 @ 1 Mbit/s, RX thread running
     rmd_init();          // subscribes RMD feedback decoder
     gim_init();           // subscribes GIM feedback decoder
+    odrive_init();         // subscribes ODrive (GDS68) heartbeat/feedback decoder
     imx5_init();           // subscribes IMX5 INS decoder (bus 2)
     cmd_shell_start();     // USB command line + safety watchdog
 

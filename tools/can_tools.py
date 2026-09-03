@@ -64,6 +64,7 @@ def _decode_rxf0s(rxf0s: int) -> str:
 def cmd_can_status(ser, _args):
     ser.write(b"CAN,status\r\n")
     deadline = time.monotonic() + 2.0
+    got_status = False
     while time.monotonic() < deadline:
         line = ser.readline().decode("ascii", errors="replace").strip()
         m = re.match(
@@ -84,16 +85,61 @@ def cmd_can_status(ser, _args):
             console.print("[dim]ACT=Synchronizing → baud rate mismatch or no termination[/dim]")
             console.print("[dim]LEC=Ack + TEC>0 → FC transmitting but no ack (only one node, or wrong baud)[/dim]")
             console.print("[dim]LEC=Bit1/Form/CRC + REC>0 → IMX5 transmitting at different baud rate[/dim]")
-            return
-    console.print("[red]No CAN,STATUS response — firmware may not support this command[/red]")
+            got_status = True
+            break
+    if not got_status:
+        console.print("[red]No CAN,STATUS response — firmware may not support this command[/red]")
+        return
+
+    # tx_ok/tx_fail: distinguishes "the STM32 itself can't get frames onto
+    # the wire" (tx_fail climbing -- mailbox/timeout issue) from "frames go
+    # out fine but nothing replies" (tx_fail flat, PSR/ECR above still healthy).
+    ser.reset_input_buffer()
+    ser.write(b"CAN,diag\r\n")
+    deadline = time.monotonic() + 2.0
+    console.print()
+    while time.monotonic() < deadline:
+        line = ser.readline().decode("ascii", errors="replace").strip()
+        m = re.match(
+            r"CAN,DIAG,(bus\d),total_rx=(\d+),dispatched=(\d+),"
+            r"last_sid=(0x[0-9a-fA-F]+),last_dlc=(\d+),tx_ok=(\d+),tx_fail=(\d+),"
+            r"tec=(\d+),rec=(\d+),tec_peak=(\d+),rec_peak=(\d+),"
+            r"busoff_count=(\d+),rx_fifo_lost=(\d+)", line)
+        if m:
+            (bus, total_rx, dispatched, last_sid, last_dlc, tx_ok, tx_fail,
+             tec, rec, tec_peak, rec_peak, busoff_count, rx_fifo_lost) = m.groups()
+            fail_style  = "bold red" if int(tx_fail) > 0 else "green"
+            err_style   = "bold red" if (int(tec) > 0 or int(rec) > 0) else "green"
+            event_style = "bold red" if (int(busoff_count) > 0 or int(rx_fifo_lost) > 0) else "green"
+            console.print(f"[bold]{bus}[/bold]  total_rx={total_rx}  dispatched={dispatched}  "
+                          f"last_sid={last_sid}  tx_ok={tx_ok}  "
+                          f"[{fail_style}]tx_fail={tx_fail}[/{fail_style}]")
+            console.print(f"       [{err_style}]tec={tec} rec={rec}[/{err_style}]  "
+                          f"tec_peak={tec_peak} rec_peak={rec_peak}  "
+                          f"[{event_style}]busoff_count={busoff_count} rx_fifo_lost={rx_fifo_lost}[/{event_style}]")
+        if line.startswith("CAN,DIAG,bus2"):
+            break
 
 
 # ── CAN scan ──────────────────────────────────────────────────────────────────
 
-# Bus 1: RMD hip motor responses (0x241–0x244), SDC102 wheel responses (0x245–0x246),
-#         IMX5 INS (registered dynamically by CAN.cpp)
-# Bus 2: CAN IMU and current sensor (IDs TBD)
-REGISTERED_IDS = {0x241, 0x242, 0x243, 0x244, 0x245, 0x246}
+# Bus 1: RMD hip commands+replies, SAME id both ways (0x140+id, confirmed by
+#        CAN PROTOCOL V2.35 -- NOT the old 0x240+id MyActuator/RMD-X guess),
+#        so hips 1-4 are 0x141-0x144. ODrive wheels (CAN Simple) use
+#        (node_id<<5)|cmd_id -- node_id is configured per-drive (see
+#        main.cpp's can_motor_register calls: wheel L=node_id 2, wheel R=
+#        node_id 3), so these aren't derivable from the CAN slot id alone;
+#        hardcoded here to match this project's current wheel config.
+#        Heartbeat=0x01, Get_Encoder_Estimates=0x09.
+# Bus 2: IMX5 INS (std IDs 0x01-0x04, registered dynamically by CAN.cpp),
+#        Matek CAN-L4-BM power monitor (DroneCAN, extended-ID masked match --
+#        not a fixed SID, not listed here).
+REGISTERED_IDS = {
+    0x141, 0x142, 0x143, 0x144,   # hips 1-4 (RMD, cmd+reply same SID)
+    0x41, 0x49,                    # wheel L (ODrive node_id 2): Heartbeat, Get_Encoder_Estimates
+    0x61, 0x69,                    # wheel R (ODrive node_id 3): Heartbeat, Get_Encoder_Estimates
+    0x01, 0x02, 0x03, 0x04,        # IMX5 INS (bus 2)
+}
 
 
 def cmd_can_scan(ser, args):

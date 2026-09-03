@@ -56,7 +56,22 @@ public:
     // direct v/w information). u_meas: wheel radius x average angular rate,
     // sign-corrected for mounting (see StateManager). R_var: measurement
     // noise variance.
+    // NOTE: superseded by update_leg_wheel_velocity() below whenever leg FK
+    // is available — StateManager only falls back to this one when it isn't
+    // (see StateManager::update_legs_and_wheels()'s graceful-degradation
+    // branch). Kept as its own method rather than folded in so that
+    // fallback path stays a trivial, obviously-correct 1-row update.
     void update_wheel_velocity(float u_meas, float R_var);
+
+    // Combined leg+wheel body-frame velocity fusion (u AND w) — see
+    // telemetry_plan.md item F for the rigid-body-kinematics derivation.
+    // u_meas/w_meas: fused pseudo-measurements combining wheel rolling
+    // velocity with the leg's own FK-derived foot-point velocity and the
+    // body's own pitch rate (StateManager::update_legs_and_wheels()
+    // computes these). Ru/Rw: measurement noise variances — looser than
+    // update_wheel_velocity's since this stacks FK/Jacobian noise on top of
+    // the wheel encoder alone.
+    void update_leg_wheel_velocity(float u_meas, float w_meas, float Ru, float Rw);
 
     // Accessors
     const float* state()          const { return _x; }

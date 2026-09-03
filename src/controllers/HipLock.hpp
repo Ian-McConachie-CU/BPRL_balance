@@ -31,6 +31,23 @@ public:
     // hip_torques[4]: FL, FR, RL, RR — matches motor_torques[0..3] and CAN
     // ids 1..4 (see main.cpp's can_motor_register calls).
     void update(float hip_torques[4]);
+
+    // Dynamic-target overload: holds the leg at a COMMANDED leg length
+    // (and lean angle, default straight/thL=0) instead of the fixed
+    // TARGET_*_RAD constants above — used by the velocity-wheel-model
+    // path (StandUpController, LqrBalanceController) once a real leg-
+    // height command exists. Computes phi1/phi4 targets via ik() each
+    // call (cheap, closed-form) and maps them onto the 4 hips per
+    // StateManager.cpp's LEG_HIP_MAP convention (FL/FR = front = phi4,
+    // RL/RR = rear = phi1). Uses the SAME PID array/gains/torque limit as
+    // the fixed-target update() above — just a different target source,
+    // not a different control law. PidBalanceController's existing
+    // fixed-target usage is untouched. If L_target/thL_target is outside
+    // the reachable workspace, falls back to zero torque this tick (same
+    // fail-safe philosophy as "no verified feedback -> command nothing"
+    // below) rather than commanding a garbage target.
+    void update(float hip_torques[4], float L_target, float thL_target = 0.0f);
+
     void reset();
 
 private:

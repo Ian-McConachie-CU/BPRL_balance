@@ -8,7 +8,8 @@ into the full robot) to sniff CAN traffic and drive individual motors from a
 laptop while bringing up or debugging:
 
 - **LK-TECH MG8016E-i6** hip actuators (DG80R/C7 drive, confirmed CAN protocol)
-- **SteadyWin GIM6010-6** wheel motors (confirmed CAN protocol)
+- **SteadyWin GIM6010-6** wheel motors (confirmed CAN protocol) — **damaged, off the bus as of 2026-09-01, see plan.md**
+- **SteadyWin GIM6010-8 on a GDS68** (ODrive CAN Simple protocol) — current wheel motors, replacing the above
 
 It reuses this repo's `boards/CubeOrangePlus`, `cfg/`, and
 `third_party/ChibiOS` unchanged (same MCU, same clock tree) but has its own
@@ -28,6 +29,8 @@ controllers, SBUS, IMUs, or SD logging.
 | **GIM6010-6** — CAN byte layout, all command bytes, feedback decode | **Confirmed** | Vendor's "STEADYWIN MOTOR DRIVER PROTOCOL SPECIFICATION rev2.2" (SteadyWin / Skyline Innovation, user-provided). Replaces an earlier best-effort "MIT motor mode" guess that had no real basis. |
 | **GIM6010-6** — reply arbitration ID | **Confirmed — NOT same as command ID** | A GIM's reply lands on its configured **Host/Master CAN ID** (ConfID 0x13), which is a separate value from its own CAN ID (ConfID 0x12) — confirmed via `poll_wheels` against real hardware (this project's wheels: CAN ID 15→reply 16, CAN ID 20→reply 21). The driver tracks this per-motor via `gim_set_reply_id()` / `GIM,<id>,MASTERID,<reply_id>`; `motor_tool.py`'s `ensure_gim_reply_ids()` configures the known mapping before every poll. **Check each new GIM's actual CAN ID vs. Host/Master CAN ID via the GUI — don't assume they match.** |
 | **GIM6010-6** — Nm↔raw-feedback torque decode | **Placeholder** | The packed torque feedback field needs this motor's torque constant (Nm/A) and gear ratio, neither of which this driver reads automatically — see `GIM,KT,<Nm_per_A>` / `GIM,GEAR,<ratio>`. Torque *commands* are real Nm already (IEEE float, confirmed), only the *feedback decode* is a placeholder. |
+| **GIM6010-8/GDS68 (ODrive)** — Set_Axis_State (0x07), Set_Controller_Mode (0x0B), Set_Input_Vel (0x0D) | **Confirmed** | Same protocol, same command bytes, as `src/coms/CANMotor.cpp` in the parent BPRL_balance firmware — confirmed against real hardware in `final-project-Ian-McConachie-CU` (an ECEN5813 balancing-robot project using this same GIM6010-8 + ODrive combination). |
+| **GIM6010-8/GDS68 (ODrive)** — Heartbeat (0x01), Get_Encoder_Estimates (0x09), Set_Input_Torque (0x0E) | **Unconfirmed** | Standard ODrive CAN Simple numbering for this firmware family, but that reference project never exercised them (open-loop velocity only, no feedback read) — treat as unconfirmed until checked against this project's real GDS68 traffic. Heartbeat's *use as a liveness signal* (not its decoded fields) is what `ODRIVE,LIST`/`find odrive` relies on, and that only needs the arbitration-ID convention (`node_id<<5 \| cmd_id`), not the payload layout. |
 
 **Real, non-obvious bugs this surfaced** (worth remembering if a future
 motor's behavior looks impossible rather than just broken):
@@ -93,6 +96,13 @@ and are *not* guaranteed to match (this project's two wheels: 15→16,
 20→21). Check both via the GUI for any new GIM before assuming they're the
 same — see the confidence table above.
 
+**GIM6010-8/GDS68 wiring:** ODrive CAN Simple addressing — a single
+**node_id** (this project's wheels: L=2, R=3) is both the command target and
+the reply source (arbitration ID = `node_id<<5 | cmd_id`), unlike the GIM's
+split CAN ID/Master ID. No blind scan needed to find one: `find odrive`
+(Python) or `ODRIVE,LIST` (raw) just listens for the Heartbeat every ODrive
+axis broadcasts on its own once powered.
+
 **Current sensor (bus 2):** present on this project's hardware but **not
 supported by this firmware** — no protocol reference obtained yet. `bus 2`
 + `scan`/`monitor` will show its raw traffic; see `plan.md` for the plan to
@@ -155,6 +165,14 @@ One command per line, `\n`-terminated, 115200 (ignored by USB CDC). Send
 | `GIM,<id>,IND,<ind_id>` | Request one runtime indicator (0=bus V, 2=motor temp, 14=speed RPM, ...) |
 | `GIM,LIMIT,<Nm>` | Get/set the GIM torque clamp |
 | `GIM,KT,<Nm_per_A>` / `GIM,GEAR,<ratio>` | Set the constants used to decode GIM torque feedback |
+| `ODRIVE,LIST` | List every node_id seen via Heartbeat — the GDS68 scanner. No probing: an ODrive axis broadcasts Heartbeat unconditionally (~10 Hz) the moment it's powered, and this has been decoding it in the background since boot; `ODRIVE,LIST` just reads what's already been overheard. |
+| `ODRIVE,<id>,START` | GDS68/ODrive: torque-control mode + closed-loop (0x0B then 0x07) |
+| `ODRIVE,<id>,IDLE` \| `STOP` | GDS68/ODrive: `Set_Axis_State(IDLE)` (0x07) |
+| `ODRIVE,<id>,MODE,TORQUE\|VELOCITY` | GDS68/ODrive: `Set_Controller_Mode` (0x0B) |
+| `ODRIVE,<id>,TORQUE,<Nm>` | GDS68/ODrive: `Set_Input_Torque`, output-shaft-referenced, clamped (0x0E) |
+| `ODRIVE,<id>,VELOCITY,<rad/s>` | GDS68/ODrive: `Set_Input_Vel`, output-shaft-referenced (0x0D) |
+| `ODRIVE,GEAR,<ratio>` | Get/set the GIM6010-8 gear ratio used for torque/velocity scaling and encoder decode (default 8, matches `ODRIVE_GEAR_RATIO` in the parent firmware) |
+| `ODRIVE,LIMIT,<Nm>` | Get/set the ODrive torque clamp |
 | `IMU,status` | Decode the IMX5 INS on bus 2 (roll/pitch/yaw, rates, accel) |
 
 ## Python ground tool
@@ -167,7 +185,8 @@ python3 tools/motor_tool.py                # auto-detects the port, starts a REP
 Type `help` inside the REPL for the interactive command list — it now
 wraps a lot more than the raw USB commands above: raw-byte diagnostics per
 device (`poll hips`, `poll gim`, `poll wheels`), motion tests (`test hips`,
-`test drift`), a live gearbox-corrected encoder feed (`encoder`), plus
+`test drift`), a live gearbox-corrected encoder feed (`encoder`), device
+discovery (`find gim`, `find odrive`), plus
 `monitor`/`scan`/`selftest`. **See `plan.md`'s "Tool inventory" section for
 the full list organized by which hardware each command exercises** — that's
 the maintained reference now that the tool has grown well past what fits

@@ -15,7 +15,7 @@ pip install pyserial rich
 | Script | Subcommands | DEBUG build? |
 |---|---|---|
 | `telemetry.py` | `telemetry`, `ekf-status`, `imu-compare` | Required |
-| `motor_test.py` | `motor-test` | No |
+| `motor_test.py` | `motor-status`, `wheel-status`, `motor-sweep` | No |
 | `radio_test.py` | `rc-status` | No |
 | `targets_test.py` | `tgt-status` | No |
 | `calibrate.py` | `calibrate` | Required |
@@ -51,21 +51,40 @@ python3 tools/telemetry.py imu-compare
 
 > Works on any firmware build.
 
-Interactive CAN motor test. Currently supports reading motor state via the `MOTOR,status` USB command.
-Torque and velocity commands are stubbed pending firmware-side USB handlers.
+Live status of all 6 CAN motors, and a bench sweep test for exercising one
+motor at a time. Both go through the exact same firmware command path
+(`MOTOR,status` / `MOTOR,test,*`) the real controller uses — the hip safety
+gate in `src/coms/CANMotor.cpp` (zero-offset, angle/velocity soft limits,
+hard torque clamp) applies here exactly as it does in normal operation.
 
 ```bash
-python3 tools/motor_test.py motor-test
+python3 tools/motor_test.py motor-status              # live angle + speed, all 6 motors
+python3 tools/motor_test.py wheel-status               # ONLY the 2 wheels, actively requested
+python3 tools/motor_test.py motor-sweep <id>           # bench sweep test, motor <id> (1-6)
+python3 tools/motor_test.py motor-status --rate 30
 ```
 
-**Commands inside the tool:**
+`wheel-status`: unlike `motor-status` (which just displays whatever is
+already cached from passive traffic — RMD hips' replies to their own
+torque/velocity commands, ODrive wheels' own periodic broadcast), this
+actively sends `MOTOR,<id>,request` for wheels 5/6 before each read —
+an RTR frame for `Get_Encoder_Estimates` (`can_motor_request_encoder()` in
+`CANMotor.cpp`) — so it doesn't depend on the ODrive's own broadcast timing.
+Safe at this tool's polling rate (10-20 Hz); the *same* call was previously
+tried from `ControlThread` at 400 Hz and found to overload the CAN bus (see
+`telemetry_plan.md` item C) — that is a very different load than a few
+requests a second from a ground tool.
 
-| Command | Description |
-|---|---|
-| `status` | Print position, velocity, torque, and temperature for all 6 CAN motors |
-| `quit` | Exit |
+`motor-sweep`: hips (1–4) slowly sweep positive until they hit their safety
+bound, then negative until they hit the other bound, repeating, while their
+live angle/rate is shown; wheels (5–6) slowly spin one full output-shaft
+rotation, then reverse, repeating. Only runs while the robot is **disarmed**
+— arming the transmitter stops it immediately (`ControlThread` treats arming
+as an abort signal). Ctrl-C here also always stops it (`MOTOR,test,stop` is
+sent on every exit path, including errors).
 
-Motor IDs: 1–4 = hip joints (LKMTECH MG8016E-i6, RMD protocol), 5–6 = wheels (Steadywin GIM6010-6, SDC102).
+Motor IDs: 1–4 = hip joints (LKMTECH MG8016E-i6, RMD protocol), 5–6 = wheels
+(Steadywin GIM6010-8 on a GDS68 board, ODrive CAN Simple protocol).
 
 ---
 
